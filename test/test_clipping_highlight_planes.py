@@ -49,6 +49,7 @@ int main() {
   auto page = std::make_unique<Page>(order);
   const int fontId = 0, orientedMarginTop = 0, orientedMarginLeft = 0;
   const bool absoluteImageGrayscale = false;
+  bool useGray16 = false;
   bool needsTextGrayscale = true;
   auto drawClippingHighlights = [&](Page&, int, int, int) { assert(++order == 1); };
   auto renderStatusBar = [&] { assert(++order == 3); };
@@ -58,6 +59,12 @@ int main() {
   assert(order == 3);
   order = 0;
   needsTextGrayscale = false;
+  renderGrayscalePass();
+  assert(order == 3);
+  BoardConfig::a4 = false;
+  needsTextGrayscale = true;
+  useGray16 = true;
+  order = 1;
   renderGrayscalePass();
   assert(order == 3);
 }

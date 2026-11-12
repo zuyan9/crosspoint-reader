@@ -123,12 +123,16 @@ class ParsedText {
   int resolveFirstLineIndent(bool isFirstLine, const GfxRenderer& renderer, int fontId) const;
   std::vector<size_t> computeLineBreaks(const GfxRenderer& renderer, int fontId, int pageWidth,
                                         std::vector<uint16_t>& wordWidths, std::vector<bool>& continuesVec,
-                                        std::vector<bool>& noSpaceBeforeVec);
-  std::vector<size_t> computeHyphenatedLineBreaks(const GfxRenderer& renderer, int fontId, int pageWidth,
-                                                  std::vector<uint16_t>& wordWidths, std::vector<bool>& continuesVec,
-                                                  std::vector<bool>& noSpaceBeforeVec, size_t maxLines);
+                                        std::vector<bool>& noSpaceBeforeVec, bool includeLastLine = true);
+  std::vector<size_t> computeGreedyLineBreaks(const GfxRenderer& renderer, int fontId, int pageWidth,
+                                              std::vector<uint16_t>& wordWidths, std::vector<bool>& continuesVec,
+                                              std::vector<bool>& noSpaceBeforeVec, size_t maxLines);
+  bool hasNormalBreakFitting(size_t wordIndex, int availableWidth, const GfxRenderer& renderer, int fontId) const;
+  bool splitWordAtOffset(size_t wordIndex, size_t chosenOffset, bool chosenNeedsHyphen, int precomputedPrefixWidth,
+                         const GfxRenderer& renderer, int fontId, std::vector<uint16_t>& wordWidths);
   bool hyphenateWordAtIndex(size_t wordIndex, int availableWidth, const GfxRenderer& renderer, int fontId,
-                            std::vector<uint16_t>& wordWidths, bool allowFallbackBreaks);
+                            std::vector<uint16_t>& wordWidths, bool allowFallbackBreaks,
+                            bool allowOpticalRightHang = false);
   void extractLine(size_t breakIndex, int pageWidth, const std::vector<uint16_t>& wordWidths,
                    const std::vector<bool>& continuesVec, const std::vector<bool>& noSpaceBeforeVec,
                    const std::vector<size_t>& lineBreakIndices,

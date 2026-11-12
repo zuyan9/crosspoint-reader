@@ -13,10 +13,12 @@ constexpr uint16_t FONT_RASTER_DPI = 150;
 /// values (int8_t) share the same 4 fractional bits, so they can be freely
 /// added before snapping to whole pixels.
 ///
-/// Rendering and measurement use "differential rounding": each glyph step
+/// EpdFont::getTextDimensions uses differential rounding: each glyph step
 /// (previous advance + current kern) is combined in fixed-point and snapped
-/// to a pixel as one unit.  This guarantees identical character pairs always
-/// produce the same pixel spacing, regardless of position on the line.
+/// to a pixel as one unit so identical character pairs keep consistent pixel
+/// spacing in ink-bounds queries. GfxRenderer::drawText and getTextAdvanceX
+/// instead accumulate 12.4 advances and 4.4 kerning in a cumulative pen across
+/// each word so layout widths and rendered glyph positions match without drift.
 ///
 /// The helpers below eliminate the raw bit-shifts that would otherwise be
 /// scattered across every layout / measurement call site.
@@ -249,13 +251,11 @@ typedef struct {
   /// nullptr for fonts whose interval table is already complete (built-ins).
   bool (*coverageHandler)(void* ctx, uint32_t codepoint);
 
-  /// Vector-font bitmap accessor (FreeInkFont / TtfEpdFont). When non-null,
-  /// GfxRenderer::getGlyphBitmap() returns vectorBitmapHandler(glyphMissCtx, glyph)
-  /// instead of indexing ->bitmap or going through the SdCardFont overflow path.
-  /// This lets a runtime-rasterized TTF fault + cache glyphs on ANY draw path
-  /// (via glyphMissHandler) without pre-warming. nullptr for every other font,
-  /// so the SD/built-in bitmap paths are unaffected (all fonts zero-init this).
-  const uint8_t* (*vectorBitmapHandler)(void* ctx, const EpdGlyph* glyph);
+  /// Handler-backed bitmap accessor (SdCardFont slabs/overflow and TtfEpdFont).
+  /// When non-null, GfxRenderer::getGlyphBitmap() resolves glyph pixels via
+  /// bitmapHandler(glyphMissCtx, glyph) instead of indexing ->bitmap. nullptr
+  /// for built-in uncompressed and group-compressed fonts.
+  const uint8_t* (*bitmapHandler)(void* ctx, const EpdGlyph* glyph);
 
   /// Dynamic kerning for handler-backed fonts (TTF via FreeInkFont): returns
   /// the 4.4 fixed-point pixel adjustment for the pair, 0 when none. Checked
@@ -263,7 +263,14 @@ typedef struct {
   /// none). Shares glyphMissCtx. nullptr for built-in and SD fonts, whose
   /// kerning is baked into the tables above (all fonts zero-init this).
   int8_t (*kernHandler)(void* ctx, uint32_t leftCp, uint32_t rightCp);
+
+  /// True for 4-bit (16-gray, 2 pixels/byte) SD-card fonts. Appended last so
+  /// positional aggregate initializers in builtinFonts/*.h stay untouched and
+  /// zero-initialize this field to false.
+  bool is4Bit;
 } EpdFontData;
+
+constexpr uint8_t epdBitsPerPixel(const EpdFontData& d) { return d.is4Bit ? 4 : (d.is2Bit ? 2 : 1); }
 
 // Solid Unicode symbols can be drawn as rectangles when the font lacks them.
 namespace syntheticGlyph {

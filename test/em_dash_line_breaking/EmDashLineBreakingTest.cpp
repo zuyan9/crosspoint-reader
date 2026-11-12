@@ -162,11 +162,13 @@ TEST(PartialLineLayout, LastEmittedLineStillJustifiesWhenMoreTextRemains) {
     GfxRenderer renderer;
     ParsedText text(hyphenation, false, BlockStyle{}, 0);
     for (const char* word : {"one", "two", "three"}) text.addWord(word, EpdFontFamily::REGULAR);
+    // "one" (24) + space (4) + "two" (24) = 52 px; in a 58 px viewport, 6 px spare
+    // expands the gap to 10 px (4 px space + 6 px spare), aligning "two" flush right at 34..58.
     text.layoutAndExtractLines(
-        renderer, 0, 80,
+        renderer, 0, 58,
         [&](std::unique_ptr<TextBlock> line, auto) {
           ASSERT_EQ(line->wordCount(), 2);
-          EXPECT_EQ(line->wordXpos(1), 56);
+          EXPECT_EQ(line->wordXpos(1), 34);
         },
         true, 0, 100, 1);
   }

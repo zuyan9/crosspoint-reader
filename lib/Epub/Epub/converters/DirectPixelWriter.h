@@ -2,6 +2,7 @@
 
 #include <BitmapHelpers.h>
 #include <GfxRenderer.h>
+#include <GrayscaleCapabilities.h>
 #include <HalDisplay.h>
 #include <stdint.h>
 
@@ -175,6 +176,37 @@ struct DirectPixelWriter {
         state = pixel.black;
         break;
       }
+      case GfxRenderer::GRAY16_COARSE_LSB:
+        if (ditherBw || !freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskPass1Dtm1, pixelValue)) return;
+        draw = true;
+        state = false;
+        break;
+      case GfxRenderer::GRAY16_COARSE_MSB:
+        if (ditherBw || !freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskPass1Dtm2, pixelValue)) return;
+        draw = true;
+        state = false;
+        break;
+      case GfxRenderer::GRAY16_FINE_LSB:
+        if (ditherBw || !freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskPass2Dtm1, pixelValue)) return;
+        draw = true;
+        state = false;
+        break;
+      case GfxRenderer::GRAY16_FINE_MSB:
+        if (ditherBw || !freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskPass2Dtm2, pixelValue)) return;
+        draw = true;
+        state = false;
+        break;
+      case GfxRenderer::GRAY16_CLEANUP_DTM1:
+        if (ditherBw) {
+          static constexpr uint8_t BAYER[4] = {0, 2, 3, 1};
+          const uint8_t threshold = BAYER[((rowLogicalY & 1) << 1) | (logicalX & 1)];
+          state = pixelValue == 0 || (pixelValue == 1 && threshold < 3) || (pixelValue == 2 && threshold < 1);
+          draw = state;
+        } else {
+          draw = freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskCleanupBlack, pixelValue);
+          state = true;
+        }
+        break;
       default:
         return;
     }

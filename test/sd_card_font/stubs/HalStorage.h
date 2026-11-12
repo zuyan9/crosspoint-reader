@@ -7,10 +7,12 @@
 
 inline std::vector<uint8_t> sdFontTestFile;
 inline size_t sdFontTestReads = 0;
+inline size_t sdFontTestOpens = 0;
 
 struct SdFontTestEsp {
+  size_t freeHeap = 200 * 1024;
   size_t largestBlock = 200 * 1024;
-  size_t getFreeHeap() const { return 200 * 1024; }
+  size_t getFreeHeap() const { return freeHeap; }
   size_t getMaxAllocHeap() const { return largestBlock; }
 };
 inline SdFontTestEsp ESP;
@@ -31,6 +33,8 @@ class HalFile {
     return static_cast<int>(count);
   }
   void close() { opened_ = false; }
+  bool isOpen() const { return opened_; }
+  explicit operator bool() const { return opened_; }
   size_t fileSize() const { return sdFontTestFile.size(); }
   void open() {
     opened_ = true;
@@ -45,6 +49,7 @@ class HalFile {
 class HalStorage {
  public:
   bool openFileForRead(const char*, const char*, HalFile& file) {
+    sdFontTestOpens++;
     file.open();
     return true;
   }

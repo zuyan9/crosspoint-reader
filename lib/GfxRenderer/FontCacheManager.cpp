@@ -173,6 +173,10 @@ void FontCacheManager::recordText(const char* text, int fontId, EpdFontFamily::S
 FontCacheManager::PrewarmScope::PrewarmScope(FontCacheManager& manager) : manager_(&manager) {
   manager_->scanMode_ = ScanMode::Scanning;
   manager_->clearCache();
+  for (auto& [id, font] : manager_->sdCardFonts_) {
+    (void)id;
+    if (font) font->beginPrewarmScope();
+  }
   manager_->resetStats();
   manager_->scanCodepointCount_ = 0;
   manager_->scanFontCount_ = 0;
@@ -187,13 +191,14 @@ void FontCacheManager::PrewarmScope::endScanAndPrewarm() {
   std::sort(manager_->scanCodepoints_, manager_->scanCodepoints_ + manager_->scanCodepointCount_);
 
   uint16_t groupStarts[SCAN_GROUP_COUNT] = {};
+  uint16_t groupUtf8Lens[SCAN_GROUP_COUNT] = {};
   for (uint8_t group = 1; group < SCAN_GROUP_COUNT; group++) {
     groupStarts[group] = groupStarts[group - 1] + manager_->scanGroupCounts_[group - 1];
   }
 
-  // Each packed entry provides four bytes, enough for one UTF-8 codepoint.
-  // Encoding high groups first means a terminator can overwrite only a group
-  // that has already been prewarmed; unread lower groups remain intact.
+  // Phase 1: encode each group's packed codepoints into UTF-8 bytes in place.
+  // Each 4-byte entry holds one UTF-8 codepoint (1..4 bytes), so encoded bytes
+  // stay within the group's own slice before termination.
   for (int group = SCAN_GROUP_COUNT - 1; group >= 0; group--) {
     const uint16_t groupCount = manager_->scanGroupCounts_[group];
     if (groupCount == 0) continue;
@@ -205,12 +210,24 @@ void FontCacheManager::PrewarmScope::endScanAndPrewarm() {
       const uint32_t codepoint = manager_->scanCodepoints_[groupStart + i] & SCAN_CODEPOINT_MASK;
       output = utf8AppendCodepoint(output, codepoint);
     }
-    *output = '\0';
+    groupUtf8Lens[group] = static_cast<uint16_t>(output - utf8Text);
+  }
 
-    const uint8_t fontSlot = static_cast<uint8_t>(group) / 4;
-    const uint8_t style = static_cast<uint8_t>(group) & 0x03;
-    // This group is the complete glyph set for one font/style in this render.
+  // Phase 2: prewarm in forward order so fontSlot=0, style=0 (Regular body text)
+  // claims resident slabs before Bold/Italic/BoldItalic. Save and restore the
+  // boundary byte in case a group of 4-byte codepoints fills its entire slice.
+  for (uint8_t group = 0; group < SCAN_GROUP_COUNT; group++) {
+    if (manager_->scanGroupCounts_[group] == 0) continue;
+
+    char* const utf8Text = reinterpret_cast<char*>(manager_->scanCodepoints_ + groupStarts[group]);
+    const uint16_t utf8Len = groupUtf8Lens[group];
+    const char savedByte = utf8Text[utf8Len];
+    utf8Text[utf8Len] = '\0';
+
+    const uint8_t fontSlot = group / 4;
+    const uint8_t style = group & 0x03;
     manager_->prewarmCache(manager_->scanFontIds_[fontSlot], utf8Text, 1 << style, /*accumulate=*/false);
+    utf8Text[utf8Len] = savedByte;
   }
 
   manager_->scanCodepointCount_ = 0;

@@ -217,6 +217,18 @@ class EpubReaderActivity final : public ReaderActivity {
   void navigateToHref(const std::string& href, bool savePosition = false);
   void restoreSavedPosition();
 
+  struct StatusBarSnapshot {
+    std::string title;
+    float bookProgress = 0.0f;
+    int currentPage = 1;
+    int pageCount = 1;
+    int textYOffset = 0;
+    bool bookmarked = false;
+    bool isBuilding = false;
+  };
+  mutable const StatusBarSnapshot* activeStatusBarSnapshot = nullptr;
+  StatusBarSnapshot buildStatusBarSnapshot(bool recordLinkNote = true) const;
+
   void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
   void drawClippingHighlights(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft) const;
