@@ -472,6 +472,64 @@ void ActivityManager::prepareForSleep() {
   if (currentActivity) currentActivity->prepareForSleep();
 }
 
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+const char* ActivityManager::currentActivityName() const {
+  return currentActivity ? currentActivity->name.c_str() : "None";
+}
+
+bool ActivityManager::isCurrentPageBufferStale() const {
+  return currentActivity && currentActivity->isPageBufferStale();
+}
+
+void ActivityManager::notifyDevReaderFontChanged() {
+  for (const auto& activity : stackActivities) {
+    activity->onDevReaderFontChanged();
+  }
+  if (currentActivity) {
+    currentActivity->onDevReaderFontChanged();
+  }
+}
+
+void ActivityManager::notifyDevFrameBufferOverwritten() {
+  for (const auto& activity : stackActivities) {
+    activity->onDevFrameBufferOverwritten();
+  }
+  if (currentActivity) {
+    currentActivity->onDevFrameBufferOverwritten();
+  }
+}
+
+void ActivityManager::renderDevUpdateAndWait(const bool forceClean, const bool reRenderNonReader) {
+  const bool forced = forceClean && handleForcedRefresh();
+  if (forceClean && !forced) {
+    if (reRenderNonReader && currentActivity) {
+      requestedUpdate.store(false);
+      requestUpdateAndWait();
+    }
+    RenderLock lock;
+    if (renderer.hasFrameBuffer() && renderer.getFrameBuffer()) {
+      renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+    }
+    return;
+  }
+  if (!currentActivity) {
+    return;
+  }
+  requestedUpdate.store(false);
+  requestUpdateAndWait();
+}
+
+bool ActivityManager::captureComposite2bpp(void* ctx, bool (*emitRow)(void* ctx, const uint8_t* row2bpp, size_t len),
+                                           StripCaptureMeta& meta) {
+  return currentActivity && currentActivity->captureComposite2bpp(ctx, emitRow, meta);
+}
+
+bool ActivityManager::captureComposite4bpp(void* ctx, bool (*emitRow)(void* ctx, const uint8_t* row4bpp, size_t len),
+                                           StripCaptureMeta& meta) {
+  return currentActivity && currentActivity->captureComposite4bpp(ctx, emitRow, meta);
+}
+#endif
+
 void ActivityManager::requestUpdate(bool immediate) {
   if (immediate) {
     if (renderTaskHandle) {

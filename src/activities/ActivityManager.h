@@ -18,6 +18,18 @@
 class Activity;    // forward declaration
 class RenderLock;  // forward declaration
 
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+struct StripCaptureMeta {
+  const char* srcTag = "AA";
+  size_t freeBytes = 0;
+  uint16_t stripRows = 0;
+  bool usedAa = false;
+  bool heapFloorHit = false;
+  bool framebufferStale = false;
+  bool streamAborted = false;
+};
+#endif
+
 enum class HomeMenuItem { NONE, FILE_BROWSER, LIBRARY, PLUGINS, OPDS_BROWSER, FILE_TRANSFER, SETTINGS_MENU };
 
 /**
@@ -125,6 +137,19 @@ class ActivityManager {
   bool skipLoopDelay() const;
   ScreenshotInfo getScreenshotInfo() const;
   void prepareForSleep();
+
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  const char* currentActivityName() const;
+  size_t stackDepth() const { return stackActivities.size(); }
+  bool isCurrentPageBufferStale() const;
+  void notifyDevReaderFontChanged();
+  void notifyDevFrameBufferOverwritten();
+  void renderDevUpdateAndWait(bool forceClean, bool reRenderNonReader = false);
+  bool captureComposite2bpp(void* ctx, bool (*emitRow)(void* ctx, const uint8_t* row2bpp, size_t len),
+                            StripCaptureMeta& meta);
+  bool captureComposite4bpp(void* ctx, bool (*emitRow)(void* ctx, const uint8_t* row4bpp, size_t len),
+                            StripCaptureMeta& meta);
+#endif
 
   // If immediate is true, the update will be triggered immediately.
   // Otherwise, it will be deferred until the end of the current loop iteration.

@@ -10,6 +10,9 @@
 #include <HalDisplay.h>
 #include <HalFrontlight.h>
 #include <HalGPIO.h>
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+#include <HalMemory.h>
+#endif
 #include <HalStorage.h>
 #include <I18n.h>
 #include <Logging.h>
@@ -2138,11 +2141,24 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   const bool cleanImageBasePending = manualRefreshPending || pagesUntilFullRefresh <= 1;
   const bool needsTextGrayscale = SETTINGS.textAntiAliasing;
   const bool needsAnyGrayscale = needsTextGrayscale || (pageHasImages && !BoardConfig::isEegoA4());
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  const auto devX3GrayMode = display.devGetGrayscaleModeOverride();
+  bool devX3GrayOverride = gpio.deviceIsX3() && needsAnyGrayscale &&
+                           devX3GrayMode != HalDisplay::GrayscaleMode::Overlay &&
+                           display.grayscaleCapabilities(devX3GrayMode).supported();
+#endif
   bool absoluteImageGrayscale = pageHasImages && !gpio.deviceIsX3() &&
                                 display.getController() == HalDisplay::Controller::UC8279 &&
                                 renderer.grayscaleCapabilities(HalDisplay::GrayscaleMode::Absolute).supported();
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  const auto grayscale =
+      devX3GrayOverride ? display.grayscaleCapabilities(devX3GrayMode)
+                        : renderer.grayscaleCapabilities(absoluteImageGrayscale ? HalDisplay::GrayscaleMode::Absolute
+                                                                                : HalDisplay::GrayscaleMode::Overlay);
+#else
   const auto grayscale = renderer.grayscaleCapabilities(absoluteImageGrayscale ? HalDisplay::GrayscaleMode::Absolute
                                                                                : HalDisplay::GrayscaleMode::Overlay);
+#endif
   bool runGrayscalePass = needsAnyGrayscale;
   bool tiledGrayscale = runGrayscalePass && grayscale.stripUploads;
   // Paper Mono only (no other panel combines): defer the B/W base activation so
@@ -2152,8 +2168,20 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   bool combinedGrayscaleBase =
       tiledGrayscale && !pageHasImages && grayscale.base == HalDisplay::GrayscaleBase::Combined;
   const bool overlapRefresh = tiledGrayscale && grayscale.asyncBase && !pageHasImages;
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  const auto devSplitCfg = display.devGetSplitReader();
+  bool devX3SplitReader = gpio.deviceIsX3() && display.devLutSupported() && devSplitCfg.enabled && needsTextGrayscale &&
+                          tiledGrayscale && !devX3GrayOverride && renderer.getDisplayWidth() == 792 &&
+                          renderer.getDisplayHeight() == 528;
+  const auto devGray16Mode = display.devGetGray16Mode();
+  const bool wantGray16 = devGray16Mode == HalDisplay::DevGray16Mode::ForceOn ||
+                          (devGray16Mode == HalDisplay::DevGray16Mode::Auto && renderer.has4BitFontForRender(fontId));
+  bool useGray16 = needsTextGrayscale && tiledGrayscale && !devX3GrayOverride && !devX3SplitReader &&
+                   renderer.supportsGray16() && wantGray16;
+#else
   bool useGray16 =
       needsTextGrayscale && tiledGrayscale && renderer.supportsGray16() && renderer.has4BitFontForRender(fontId);
+#endif
   constexpr int STRIP_ROWS = 80;
   const int gh = renderer.getDisplayHeight();
   const int gwBytes = renderer.getDisplayWidthBytes();
@@ -2166,6 +2194,10 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       useGray16 = false;
       runGrayscalePass = false;
       combinedGrayscaleBase = false;
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+      devX3GrayOverride = false;
+      devX3SplitReader = false;
+#endif
       if (absoluteImageGrayscale) {
         absoluteImageGrayscale = false;
         renderer.setRenderMode(GfxRenderer::BW);
@@ -2207,6 +2239,12 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   drawClippingHighlights(*page, fontId, orientedMarginTop, orientedMarginLeft);
   page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
   renderStatusBar();
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  if (devX3SplitReader && renderer.getOrientation() == GfxRenderer::Portrait) {
+    renderer.fillRect(0, 264, 6, 1, true);
+    renderer.fillRect(0, 528, 6, 1, true);
+  }
+#endif
   const auto tBwRender = millis();
 
   if (absoluteImageGrayscale) {
@@ -2218,6 +2256,26 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     }
     LOG_DBG("ERS", "UC8279 image page: absolute quality waveform");
     pagesUntilFullRefresh = 1;
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  } else if (devX3GrayOverride) {
+    const bool cleanBase = cleanImageBasePending || pagesUntilFullRefresh <= 1;
+    if (devX3GrayMode == HalDisplay::GrayscaleMode::Direct && manualRefreshPending) {
+      renderer.displayBuffer(HalDisplay::HALF_REFRESH, /*keepPowered=*/true);
+    }
+    const auto baseMode = cleanBase ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
+    if (!display.displayGrayscaleBase(devX3GrayMode, baseMode, !tiledGrayscale && SETTINGS.fadingFix != 0)) {
+      LOG_ERR("ERS", "Could not start X3 dev grayscale override; displaying B/W");
+      ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
+      return;
+    }
+    if (pageHasImages) {
+      pagesUntilFullRefresh = 1;
+    } else if (pagesUntilFullRefresh <= 1) {
+      pagesUntilFullRefresh = targetRefreshInterval;
+    } else {
+      pagesUntilFullRefresh--;
+    }
+#endif
   } else if (pageHasImages) {
     // Image pages use one base refresh before the grayscale pass. FAST leaves
     // the panel receptive to the gray waveform; pending cleanup still honors
@@ -2312,7 +2370,16 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
         LOG_ERR("ERS", "OOM: grayscale strip scratch (%d bytes); skipping AA this page", gwBytes * STRIP_ROWS);
         if (absoluteImageGrayscale) renderer.setRenderMode(GfxRenderer::BW);
         bool fallbackDisplayed = false;
-        if (overlapRefresh || combinedGrayscaleBase) {
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+        if (devX3GrayOverride) {
+          renderer.cleanupGrayscaleWithFrameBuffer();
+          if (devX3GrayMode == HalDisplay::GrayscaleMode::Direct && !manualRefreshPending) {
+            renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+            fallbackDisplayed = true;
+          }
+        } else
+#endif
+            if (overlapRefresh || combinedGrayscaleBase) {
           // The BW refresh ran the shadow-free async path, so controller RAM's
           // differential baseline was never rebuilt. Even with AA skipped it must
           // be re-synced from the intact BW framebuffer, or the next differential
@@ -2324,6 +2391,136 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
         if (SETTINGS.fadingFix != 0 && !fallbackDisplayed) {
           display.powerOffBetweenFrames();
         }
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+      } else if (devX3GrayOverride) {
+        constexpr int ABS_STRIP_ROWS = STRIP_ROWS / 2;
+        uint8_t* const lsbBuf = scratch.get();
+        uint8_t* const msbBuf = scratch.get() + static_cast<size_t>(gwBytes) * ABS_STRIP_ROWS;
+        const uint8_t* const bwBase = renderer.getFrameBuffer();
+        for (int y = 0; y < gh; y += ABS_STRIP_ROWS) {
+          const int rows = (gh - y < ABS_STRIP_ROWS) ? (gh - y) : ABS_STRIP_ROWS;
+          renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
+          renderer.beginStripTarget(lsbBuf, y, rows);
+          renderer.clearScreen(0x00);
+          renderGrayscalePass();
+          renderer.endStripTarget();
+
+          renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
+          renderer.beginStripTarget(msbBuf, y, rows);
+          renderer.clearScreen(0x00);
+          renderGrayscalePass();
+          renderer.endStripTarget();
+
+          const uint8_t* const bwStrip = bwBase + static_cast<size_t>(y) * gwBytes;
+          const size_t bandBytes = static_cast<size_t>(rows) * gwBytes;
+          for (size_t i = 0; i < bandBytes; ++i) {
+            const uint8_t bw = bwStrip[i];
+            const uint8_t lsb = lsbBuf[i];
+            const uint8_t msb = msbBuf[i];
+            lsbBuf[i] = bw | lsb;
+            msbBuf[i] = bw | static_cast<uint8_t>(msb & ~lsb);
+          }
+          renderer.writeGrayscalePlaneStrip(true, lsbBuf, y, rows);
+          renderer.writeGrayscalePlaneStrip(false, msbBuf, y, rows);
+        }
+        const auto tGrayStrips = millis();
+
+        renderer.setRenderMode(GfxRenderer::BW);
+        renderer.displayGrayBuffer();
+        const auto tGrayDisplay = millis();
+
+        renderer.cleanupGrayscaleWithFrameBuffer();
+        const auto tCleanup = millis();
+
+        LOG_DBG("ERS",
+                "Page render (X3 abs/direct tiled): prewarm=%lums bw_render=%lums display=%lums "
+                "gray_strips=%lums gray_display=%lums cleanup=%lums total=%lums",
+                tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tGrayStrips - tDisplay,
+                tGrayDisplay - tGrayStrips, tCleanup - tGrayDisplay, tCleanup - t0);
+      } else if (devX3SplitReader) {
+        static uint8_t splitSavedGc[HalDisplay::DEV_LUT_ROLES][HalDisplay::DEV_LUT_LEN];
+        static constexpr HalDisplay::DevLutRole ALL_ROLES[HalDisplay::DEV_LUT_ROLES] = {
+            HalDisplay::DevLutRole::Vcom, HalDisplay::DevLutRole::Ww, HalDisplay::DevLutRole::Bw,
+            HalDisplay::DevLutRole::Wb, HalDisplay::DevLutRole::Bb};
+        for (size_t r = 0; r < HalDisplay::DEV_LUT_ROLES; ++r) {
+          display.devLutRead(HalDisplay::DevLutBank::Gc, ALL_ROLES[r], splitSavedGc[r]);
+        }
+        struct SplitLutGuard {
+          GfxRenderer& renderer;
+          ~SplitLutGuard() {
+            renderer.endStripTarget();
+            renderer.setRenderMode(GfxRenderer::BW);
+            for (size_t r = 0; r < HalDisplay::DEV_LUT_ROLES; ++r) {
+              display.devLutWriteRaw(HalDisplay::DevLutBank::Gc, ALL_ROLES[r], splitSavedGc[r]);
+            }
+          }
+        } splitGuard{renderer};
+
+        const auto orient = renderer.getOrientation();
+        const bool byColumns = (orient == GfxRenderer::Portrait || orient == GfxRenderer::PortraitInverted);
+
+        for (int b = 0; b < 3; ++b) {
+          display.devLutApplyGcQuick(devSplitCfg.lightTp[b], devSplitCfg.darkTp[b], 0x80, 0x20);
+          const int physBand =
+              (orient == GfxRenderer::PortraitInverted || orient == GfxRenderer::LandscapeClockwise) ? (2 - b) : b;
+          const size_t colStart = static_cast<size_t>(physBand) * 33;
+          const size_t colEnd = colStart + 33;
+          const int rowStart = physBand * 176;
+          const int rowEnd = rowStart + 176;
+
+          for (int plane = 0; plane < 2; ++plane) {
+            const bool lsbPlane = (plane == 0);
+            renderer.setRenderMode(lsbPlane ? GfxRenderer::GRAYSCALE_LSB : GfxRenderer::GRAYSCALE_MSB);
+            for (int y = 0; y < gh; y += STRIP_ROWS) {
+              const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
+              if (!byColumns && (y + rows <= rowStart || y >= rowEnd)) {
+                memset(scratch.get(), 0x00, static_cast<size_t>(rows) * gwBytes);
+                renderer.writeGrayscalePlaneStrip(lsbPlane, scratch.get(), y, rows);
+                continue;
+              }
+              renderer.beginStripTarget(scratch.get(), y, rows);
+              renderer.clearScreen(0x00);
+              renderGrayscalePass();
+              renderer.endStripTarget();
+
+              for (int r = 0; r < rows; ++r) {
+                uint8_t* const rowPtr = scratch.get() + static_cast<size_t>(r) * gwBytes;
+                if (byColumns) {
+                  if (colStart > 0) memset(rowPtr, 0x00, colStart);
+                  if (colEnd < static_cast<size_t>(gwBytes)) {
+                    memset(rowPtr + colEnd, 0x00, static_cast<size_t>(gwBytes) - colEnd);
+                  }
+                } else {
+                  const int py = y + r;
+                  if (py < rowStart || py >= rowEnd) {
+                    memset(rowPtr, 0x00, static_cast<size_t>(gwBytes));
+                  }
+                }
+              }
+              renderer.writeGrayscalePlaneStrip(lsbPlane, scratch.get(), y, rows);
+            }
+          }
+          if (b == 2) {
+            renderer.setRenderMode(GfxRenderer::BW);
+            renderer.displayGrayBuffer();
+          } else {
+            display.displayGrayBuffer(false);
+          }
+        }
+
+        for (size_t r = 0; r < HalDisplay::DEV_LUT_ROLES; ++r) {
+          display.devLutWriteRaw(HalDisplay::DevLutBank::Gc, ALL_ROLES[r], splitSavedGc[r]);
+        }
+        const auto tGrayDisplay = millis();
+        renderer.cleanupGrayscaleWithFrameBuffer();
+        const auto tCleanup = millis();
+
+        LOG_DBG("ERS",
+                "Page render (X3 split reader): prewarm=%lums bw_render=%lums display=%lums "
+                "gray_3pass=%lums cleanup=%lums total=%lums",
+                tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tGrayDisplay - tDisplay,
+                tCleanup - tGrayDisplay, tCleanup - t0);
+#endif
       } else if (useGray16) {
         const auto streamGray16Plane = [&](const GfxRenderer::RenderMode mode, const bool lsbPlane) {
           renderer.setRenderMode(mode);
@@ -3629,3 +3826,276 @@ CrossPointPosition EpubReaderActivity::getCurrentPosition() const {
   }
   return localPos;
 }
+
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+bool EpubReaderActivity::captureCompositeStrips(const bool fourBit, void* ctx,
+                                                bool (*emitRow)(void* ctx, const uint8_t* row, size_t len),
+                                                StripCaptureMeta& meta) {
+  if (!renderer.hasFrameBuffer() || !renderer.getFrameBuffer()) return false;
+  if (pageBufferStale.load(std::memory_order_acquire)) {
+    meta.framebufferStale = true;
+    return false;
+  }
+  if (!epub || !section || isAtEndOfBook()) return false;
+  if (overlay != Overlay::None || inputOverPage()) return false;
+  if (showBookmarkMessage || showDictionaryMessage || showFontDamagedMessage || showClippingMessage ||
+      loadFailurePopup.isActive()) {
+    return false;
+  }
+  if (display.isInverted()) return false;
+  if (section->currentPage < 0 || section->currentPage >= section->pageCount) return false;
+
+  const bool imageGrayscale = SETTINGS.imageRendering != CrossPointSettings::IMAGES_DISPLAY_BW;
+  const bool needsTextGrayscale = SETTINGS.textAntiAliasing != 0;
+  if (!needsTextGrayscale && !imageGrayscale) return false;
+
+  auto page = section->loadPage(section->currentPage);
+  if (!page) return false;
+
+  const bool pageHasImages = imageGrayscale && page->hasImages();
+  const bool needsAnyGrayscale = needsTextGrayscale || (pageHasImages && !BoardConfig::isEegoA4());
+  if (!needsAnyGrayscale) return false;
+
+  int orientedMarginTop = 0;
+  int orientedMarginRight = 0;
+  int orientedMarginBottom = 0;
+  int orientedMarginLeft = 0;
+  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
+                                   &orientedMarginLeft);
+  orientedMarginTop += SETTINGS.screenMargin;
+  orientedMarginLeft += SETTINGS.screenMargin;
+
+  const int fontId = SETTINGS.getReaderFontId();
+  ImageBlock::clearRenderFailures();
+  struct PxcSlotGuard {
+    ~PxcSlotGuard() { ImageBlock::releaseRenderCache(); }
+  } pxcSlotGuard;
+
+  struct StatusBarScope {
+    const EpubReaderActivity& self;
+    StatusBarSnapshot snapshot;
+    const StatusBarSnapshot* prev;
+    explicit StatusBarScope(const EpubReaderActivity& activity)
+        : self(activity),
+          snapshot(activity.buildStatusBarSnapshot(/*recordLinkNote=*/false)),
+          prev(activity.activeStatusBarSnapshot) {
+      self.activeStatusBarSnapshot = &snapshot;
+    }
+    ~StatusBarScope() { self.activeStatusBarSnapshot = prev; }
+  } statusBarScope{*this};
+  std::optional<FontCacheManager::PrewarmScope> scope;
+  if (auto* fcm = renderer.getFontCacheManager()) {
+    scope.emplace(fcm->createPrewarmScope());
+    page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
+    renderStatusBar();
+    scope->endScanAndPrewarm();
+  }
+
+  const auto devGray16Mode = display.devGetGray16Mode();
+  const bool wantGray16 = devGray16Mode == HalDisplay::DevGray16Mode::ForceOn ||
+                          (devGray16Mode == HalDisplay::DevGray16Mode::Auto && renderer.has4BitFontForRender(fontId));
+  const bool useGray16 = fourBit && needsTextGrayscale && renderer.supportsGray16() && wantGray16 &&
+                         display.devGetGrayscaleModeOverride() == HalDisplay::GrayscaleMode::Overlay &&
+                         !display.devGetSplitReader().enabled;
+
+  const size_t minFreeFloor = fourBit ? (50 * 1024) : (52 * 1024);
+  const size_t blockReserve = fourBit ? (6 * 1024) : (8 * 1024);
+  constexpr int CANDIDATE_ROWS[] = {80, 40, 16};
+  const int gh = renderer.getDisplayHeight();
+  const int gwBytes = renderer.getDisplayWidthBytes();
+  const size_t outStride = static_cast<size_t>(gwBytes) * (fourBit ? 4u : 2u);
+  static uint8_t packRowBuf[HalDisplay::DISPLAY_WIDTH_BYTES * 4];
+  if (outStride > sizeof(packRowBuf)) return false;
+
+  // Include one dedicated B/W base strip so capture never depends on frameBuffer's post-cleanup mask.
+  const size_t numPlanes = useGray16 ? 5u : 3u;
+  const auto heap = HalMemory::getInternalHeap();
+  int stripRows = 0;
+  for (const int candidate : CANDIDATE_ROWS) {
+    const size_t needed = numPlanes * static_cast<size_t>(gwBytes) * candidate;
+    if (heap.freeBytes >= needed + minFreeFloor && heap.largestBlockBytes >= needed + blockReserve) {
+      stripRows = candidate;
+      break;
+    }
+  }
+  if (stripRows == 0) {
+    LOG_ERR("DEV", "%s heap floor hit (free=%zu, maxBlk=%zu)", fourBit ? "SNAP4" : "SNAP2", heap.freeBytes,
+            heap.largestBlockBytes);
+    meta.heapFloorHit = true;
+    meta.freeBytes = heap.freeBytes;
+    return false;
+  }
+
+  const size_t planeStripBytes = static_cast<size_t>(gwBytes) * stripRows;
+  auto scratch = makeUniqueNoThrow<uint8_t[]>(planeStripBytes * numPlanes);
+  if (!scratch) {
+    LOG_ERR("DEV", "%s OOM allocating %zu bytes", fourBit ? "SNAP4" : "SNAP2", planeStripBytes * numPlanes);
+    meta.heapFloorHit = true;
+    meta.freeBytes = heap.freeBytes;
+    return false;
+  }
+
+  struct StripCaptureGuard {
+    GfxRenderer& renderer;
+    bool prevDither;
+    bool prevGray16Base;
+    ~StripCaptureGuard() {
+      renderer.endStripTarget();
+      renderer.setRenderMode(GfxRenderer::BW);
+      renderer.setDitherImagesInBw(prevDither);
+      renderer.setGray16Base(prevGray16Base);
+    }
+  } captureGuard{renderer, renderer.imagesDitheredInBw(), renderer.isGray16Base()};
+  renderer.setDitherImagesInBw(!imageGrayscale);
+  renderer.setGray16Base(useGray16);
+
+  static constexpr uint8_t SPREAD_NIBBLE[16] = {0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15,
+                                                0x40, 0x41, 0x44, 0x45, 0x50, 0x51, 0x54, 0x55};
+
+  meta.usedAa = true;
+  meta.srcTag = fourBit ? (useGray16 ? "AA16" : "AA4") : "AA";
+  meta.stripRows = static_cast<uint16_t>(stripRows);
+  meta.freeBytes = heap.freeBytes;
+
+  auto renderBwStrip = [&](uint8_t* dst, int y, int rows) {
+    renderer.setRenderMode(GfxRenderer::BW);
+    renderer.beginStripTarget(dst, y, rows);
+    renderer.clearScreen(0xFF);
+    drawClippingHighlights(*page, fontId, orientedMarginTop, orientedMarginLeft);
+    page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
+    renderStatusBar();
+    renderer.endStripTarget();
+  };
+
+  auto renderGrayStrip = [&](GfxRenderer::RenderMode mode, uint8_t* dst, int y, int rows) {
+    renderer.setRenderMode(mode);
+    renderer.beginStripTarget(dst, y, rows);
+    renderer.clearScreen(0x00);
+    if (needsTextGrayscale) {
+      page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
+    } else {
+      page->renderImages(renderer, fontId, orientedMarginLeft, orientedMarginTop);
+    }
+    if (useGray16) renderStatusBar();
+    renderer.endStripTarget();
+  };
+
+  uint8_t* const bwBuf = scratch.get();
+  for (int y = 0; y < gh; y += stripRows) {
+    const int rows = (gh - y < stripRows) ? (gh - y) : stripRows;
+    renderBwStrip(bwBuf, y, rows);
+
+    if (useGray16) {
+      uint8_t* const cLsb = bwBuf + planeStripBytes;
+      uint8_t* const cMsb = cLsb + planeStripBytes;
+      uint8_t* const fLsb = cMsb + planeStripBytes;
+      uint8_t* const fMsb = fLsb + planeStripBytes;
+      renderGrayStrip(GfxRenderer::GRAY16_COARSE_LSB, cLsb, y, rows);
+      renderGrayStrip(GfxRenderer::GRAY16_COARSE_MSB, cMsb, y, rows);
+      renderGrayStrip(GfxRenderer::GRAY16_FINE_LSB, fLsb, y, rows);
+      renderGrayStrip(GfxRenderer::GRAY16_FINE_MSB, fMsb, y, rows);
+
+      for (int r = 0; r < rows; ++r) {
+        const size_t rowOff = static_cast<size_t>(r) * gwBytes;
+        const uint8_t* const bwRow = bwBuf + rowOff;
+        const uint8_t* const clRow = cLsb + rowOff;
+        const uint8_t* const cmRow = cMsb + rowOff;
+        const uint8_t* const flRow = fLsb + rowOff;
+        const uint8_t* const fmRow = fMsb + rowOff;
+        for (int col = 0; col < gwBytes; ++col) {
+          const uint8_t bw = bwRow[col];
+          const uint8_t cl = clRow[col];
+          const uint8_t cm = cmRow[col];
+          const uint8_t fl = flRow[col];
+          const uint8_t fm = fmRow[col];
+          for (int pair = 0; pair < 4; ++pair) {
+            const int hiBit = 7 - pair * 2;
+            const int loBit = 6 - pair * 2;
+            const uint8_t c0 =
+                static_cast<uint8_t>((((bw >> hiBit) & 1u) << 4) | (((cl >> hiBit) & 1u) << 3) |
+                                     (((cm >> hiBit) & 1u) << 2) | (((fl >> hiBit) & 1u) << 1) | ((fm >> hiBit) & 1u));
+            const uint8_t c1 =
+                static_cast<uint8_t>((((bw >> loBit) & 1u) << 4) | (((cl >> loBit) & 1u) << 3) |
+                                     (((cm >> loBit) & 1u) << 2) | (((fl >> loBit) & 1u) << 1) | ((fm >> loBit) & 1u));
+            packRowBuf[col * 4 + pair] =
+                static_cast<uint8_t>((freeink::gray16::kDecodeGray16[c0] << 4) | freeink::gray16::kDecodeGray16[c1]);
+          }
+        }
+        if (!emitRow(ctx, packRowBuf, outStride)) {
+          meta.streamAborted = true;
+          return false;
+        }
+      }
+    } else {
+      uint8_t* const lsbBuf = bwBuf + planeStripBytes;
+      uint8_t* const msbBuf = lsbBuf + planeStripBytes;
+      renderGrayStrip(GfxRenderer::GRAYSCALE_LSB, lsbBuf, y, rows);
+      renderGrayStrip(GfxRenderer::GRAYSCALE_MSB, msbBuf, y, rows);
+
+      for (int r = 0; r < rows; ++r) {
+        const size_t rowOff = static_cast<size_t>(r) * gwBytes;
+        const uint8_t* const bwRow = bwBuf + rowOff;
+        const uint8_t* const lRow = lsbBuf + rowOff;
+        const uint8_t* const mRow = msbBuf + rowOff;
+        for (int col = 0; col < gwBytes; ++col) {
+          const uint8_t bw = bwRow[col];
+          const uint8_t g1 = bw | static_cast<uint8_t>(mRow[col] & ~lRow[col]);
+          const uint8_t g0 = bw | lRow[col];
+          if (fourBit) {
+            for (int pair = 0; pair < 4; ++pair) {
+              const int hiBit = 7 - pair * 2;
+              const int loBit = 6 - pair * 2;
+              const uint8_t v0 = static_cast<uint8_t>((((g1 >> hiBit) & 1u) << 1) | ((g0 >> hiBit) & 1u)) * 5u;
+              const uint8_t v1 = static_cast<uint8_t>((((g1 >> loBit) & 1u) << 1) | ((g0 >> loBit) & 1u)) * 5u;
+              packRowBuf[col * 4 + pair] = static_cast<uint8_t>((v0 << 4) | v1);
+            }
+          } else {
+            packRowBuf[col * 2] = static_cast<uint8_t>((SPREAD_NIBBLE[g1 >> 4] << 1) | SPREAD_NIBBLE[g0 >> 4]);
+            packRowBuf[col * 2 + 1] = static_cast<uint8_t>((SPREAD_NIBBLE[g1 & 0x0F] << 1) | SPREAD_NIBBLE[g0 & 0x0F]);
+          }
+        }
+        if (!emitRow(ctx, packRowBuf, outStride)) {
+          meta.streamAborted = true;
+          return false;
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+bool EpubReaderActivity::captureComposite2bpp(void* ctx, bool (*emitRow)(void* ctx, const uint8_t* row2bpp, size_t len),
+                                              StripCaptureMeta& meta) {
+  return captureCompositeStrips(false, ctx, emitRow, meta);
+}
+
+bool EpubReaderActivity::captureComposite4bpp(void* ctx, bool (*emitRow)(void* ctx, const uint8_t* row4bpp, size_t len),
+                                              StripCaptureMeta& meta) {
+  return captureCompositeStrips(true, ctx, emitRow, meta);
+}
+
+void EpubReaderActivity::onDevReaderFontChanged() {
+  if (section) {
+    rememberCurrentContentOffset();
+    cachedSpineIndex = currentSpineIndex;
+    cachedChapterTotalPageCount = section->pageCount;
+    nextPageNumber = section->currentPage;
+    section.reset();
+  }
+  currentPageFootnotes.clear();
+  currentPageLinks.clear();
+  idlePrewarmSpine = -1;
+  idlePrewarmPage = -1;
+  backgroundBuildFailedSpine = -1;
+  settleOverlayRefresh();
+  discardOverlayPage();
+  pageBufferStale.store(true, std::memory_order_release);
+}
+
+void EpubReaderActivity::onDevFrameBufferOverwritten() {
+  settleOverlayRefresh();
+  discardOverlayPage();
+  pageBufferStale.store(true, std::memory_order_release);
+}
+#endif

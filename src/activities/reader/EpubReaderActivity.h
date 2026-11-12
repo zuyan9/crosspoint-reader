@@ -261,6 +261,11 @@ class EpubReaderActivity final : public ReaderActivity {
   void renderBook() override;
   void onEndOfBookRendered() override;
 
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  bool captureCompositeStrips(bool fourBit, void* ctx, bool (*emitRow)(void* ctx, const uint8_t* row, size_t len),
+                              StripCaptureMeta& meta);
+#endif
+
  public:
   explicit EpubReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string bookPath,
                               bool allowFastInitialRefresh)
@@ -280,4 +285,13 @@ class EpubReaderActivity final : public ReaderActivity {
 
   ScreenshotInfo getScreenshotInfo() const override;
   CrossPointPosition getCurrentPosition() const;
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  bool isPageBufferStale() const override { return pageBufferStale.load(std::memory_order_acquire); }
+  void onDevReaderFontChanged() override;
+  void onDevFrameBufferOverwritten() override;
+  bool captureComposite2bpp(void* ctx, bool (*emitRow)(void* ctx, const uint8_t* row2bpp, size_t len),
+                            StripCaptureMeta& meta) override;
+  bool captureComposite4bpp(void* ctx, bool (*emitRow)(void* ctx, const uint8_t* row4bpp, size_t len),
+                            StripCaptureMeta& meta) override;
+#endif
 };

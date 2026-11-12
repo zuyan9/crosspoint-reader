@@ -114,9 +114,22 @@ void HalGPIO::begin() {
   // re-inits I2C/SPI and is unsafe to call here. inputMgr.begin() has started Wire.
   if (BoardConfig::ACTIVE.board == BoardConfig::Board::LilyGoT5S3) {
     BoardT5S3::setPca9535PinMode(PCA9535_IO12_BUTTON, INPUT);
-    InputManager::setButtonHook(
-        []() -> uint8_t { return BoardT5S3::readButton() ? static_cast<uint8_t>(1U << InputManager::BTN_DOWN) : 0; });
+    InputManager::setButtonHook([]() -> uint8_t {
+      const uint8_t hw = BoardT5S3::readButton() ? static_cast<uint8_t>(1U << InputManager::BTN_DOWN) : 0;
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+      return static_cast<uint8_t>(hw | gpio.getVirtualButtonMask());
+#else
+      return hw;
+#endif
+    });
   }
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  else {
+    InputManager::setButtonHook([]() -> uint8_t { return gpio.getVirtualButtonMask(); });
+  }
+#endif
+#elif defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  InputManager::setButtonHook([]() -> uint8_t { return gpio.getVirtualButtonMask(); });
 #endif
 }
 
@@ -147,6 +160,9 @@ bool HalGPIO::wasReleased(uint8_t buttonIndex) const { return inputMgr.wasReleas
 bool HalGPIO::wasAnyReleased() const { return inputMgr.wasAnyReleased(); }
 
 bool HalGPIO::rawInputActive() {
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  if (virtualButtonMask != 0) return true;
+#endif
   if (inputMgr.isPowerButtonPhysicallyPressed()) return true;
 #if FREEINK_DEVICE_LILYGO
   if (BoardConfig::ACTIVE.board == BoardConfig::Board::LilyGoT5S3 && BoardT5S3::readButton()) return true;

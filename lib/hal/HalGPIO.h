@@ -47,6 +47,9 @@ class HalGPIO {
   bool usbStateChanged = false;
   uint8_t previousCapacitivePageButtons = 0;
   bool capacitivePagePressed = false;
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  uint8_t virtualButtonMask = 0;
+#endif
 
  public:
   enum class DeviceType : uint8_t { X4, X3 };
@@ -120,6 +123,11 @@ class HalGPIO {
   bool wasSwipe(float& nxStart, float& nyStart, float& nxEnd, float& nyEnd) const;
   bool wasTouchActivity() const;
   void setSharedConfirmPowerShortPressEmitsPower(bool enabled);
+
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  void setVirtualButtonMask(uint8_t mask) { virtualButtonMask = mask; }
+  uint8_t getVirtualButtonMask() const { return virtualButtonMask; }
+#endif
 
   // Verify that the physical power button remains held through input debounce.
   // Returns true if verification succeeded, false if device should return to sleep.

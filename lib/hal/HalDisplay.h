@@ -135,8 +135,54 @@ class HalDisplay {
   uint16_t getDisplayWidthBytes() const;
   uint32_t getBufferSize() const;
 
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  static constexpr size_t DEV_LUT_LEN = 42;
+  static constexpr size_t DEV_LUT_ROLES = 5;
+  static constexpr size_t DEV_LUT_GROUPS = 7;
+
+  enum class DevLutBank : uint8_t { Gc, Pre, Direct, Lut16Pre, Lut16Pass1, Lut16Pass2 };
+  enum class DevLutRole : uint8_t { Vcom = 0, Ww = 1, Bw = 2, Wb = 3, Bb = 4 };
+  enum class DevGray16Mode : uint8_t { Auto, ForceOn, ForceOff };
+
+  struct DevSplitReaderConfig {
+    bool enabled = false;
+    uint8_t lightTp[3] = {3, 5, 8};
+    uint8_t darkTp[3] = {2, 3, 4};
+  };
+
+  bool devLutSupported() const;
+  bool devLutModified() const;
+  bool devLutRead(DevLutBank bank, DevLutRole role, uint8_t out[DEV_LUT_LEN]) const;
+  bool devLutWriteGroup(DevLutBank bank, DevLutRole role, uint8_t group, uint8_t level, uint8_t tp0, uint8_t tp1,
+                        uint8_t tp2, uint8_t tp3, uint8_t rp);
+  bool devLutWriteTimings(DevLutBank bank, uint8_t group, uint8_t tp0, uint8_t tp1, uint8_t tp2, uint8_t tp3,
+                          uint8_t rp);
+  bool devLutWriteRaw(DevLutBank bank, DevLutRole role, const uint8_t bytes[DEV_LUT_LEN]);
+  bool devLutApplyGcQuick(uint8_t lightTp, uint8_t darkTp, uint8_t lvLight, uint8_t lvDark);
+  bool devLutReset(DevLutBank bank);
+  bool devLutResetAll();
+
+  bool devLut16ReadParams(uint8_t& pllBase, uint8_t& pll1, uint8_t& pll2, uint8_t& vdl2) const;
+  bool devLut16Tune(uint8_t pll1, uint8_t pll2, uint8_t vdl2);
+  bool devLut16Reset();
+  bool devLut16Modified() const;
+  bool devIsGray16CleanupActive() const;
+
+  GrayscaleMode devGetGrayscaleModeOverride() const { return devGrayscaleModeOverride; }
+  void devSetGrayscaleModeOverride(GrayscaleMode mode) { devGrayscaleModeOverride = mode; }
+  DevGray16Mode devGetGray16Mode() const { return devGray16Mode; }
+  void devSetGray16Mode(DevGray16Mode mode) { devGray16Mode = mode; }
+  const DevSplitReaderConfig& devGetSplitReader() const { return devSplitReader; }
+  void devSetSplitReader(const DevSplitReaderConfig& cfg) { devSplitReader = cfg; }
+#endif
+
  private:
   EInkDisplay einkDisplay;
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  GrayscaleMode devGrayscaleModeOverride = GrayscaleMode::Overlay;
+  DevGray16Mode devGray16Mode = DevGray16Mode::Auto;
+  DevSplitReaderConfig devSplitReader;
+#endif
 };
 
 extern HalDisplay display;

@@ -1,6 +1,13 @@
 #include <HalDisplay.h>
 #include <HalGPIO.h>
 
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+#include <cstring>
+#if FREEINK_DRIVER_UC8253_X3
+#include <Uc8253X3Config.h>
+#endif
+#endif
+
 // Global HalDisplay instance
 HalDisplay display;
 
@@ -173,3 +180,317 @@ uint16_t HalDisplay::getDisplayHeight() const { return einkDisplay.getDisplayHei
 uint16_t HalDisplay::getDisplayWidthBytes() const { return einkDisplay.getDisplayWidthBytes(); }
 
 uint32_t HalDisplay::getBufferSize() const { return einkDisplay.getBufferSize(); }
+
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+#if FREEINK_DRIVER_UC8253_X3
+namespace {
+
+struct DevUc8253LutStore {
+  uint8_t gcRam[HalDisplay::DEV_LUT_ROLES][HalDisplay::DEV_LUT_LEN];
+  uint8_t preBwMidRam[HalDisplay::DEV_LUT_ROLES][HalDisplay::DEV_LUT_LEN];
+  uint8_t directGrayRam[HalDisplay::DEV_LUT_ROLES][HalDisplay::DEV_LUT_LEN];
+  uint8_t lut16PreRam[HalDisplay::DEV_LUT_ROLES][HalDisplay::DEV_LUT_LEN];
+  uint8_t lut16Pass1Ram[HalDisplay::DEV_LUT_ROLES][HalDisplay::DEV_LUT_LEN];
+  uint8_t lut16Pass2Ram[HalDisplay::DEV_LUT_ROLES][HalDisplay::DEV_LUT_LEN];
+  freeink::Uc8253LutBank directGrayBank;
+  freeink::Uc8253X3Config cfg;
+  bool initialized = false;
+};
+
+DevUc8253LutStore devLutStore;
+
+void copyBankToRam(const freeink::Uc8253LutBank& src, uint8_t dst[HalDisplay::DEV_LUT_ROLES][HalDisplay::DEV_LUT_LEN]) {
+  memcpy(dst[0], src.vcom, HalDisplay::DEV_LUT_LEN);
+  memcpy(dst[1], src.ww, HalDisplay::DEV_LUT_LEN);
+  memcpy(dst[2], src.bw, HalDisplay::DEV_LUT_LEN);
+  memcpy(dst[3], src.wb, HalDisplay::DEV_LUT_LEN);
+  memcpy(dst[4], src.bb, HalDisplay::DEV_LUT_LEN);
+}
+
+void bindRamToBank(uint8_t ram[HalDisplay::DEV_LUT_ROLES][HalDisplay::DEV_LUT_LEN], freeink::Uc8253LutBank& dst) {
+  dst = {ram[0], ram[1], ram[2], ram[3], ram[4]};
+}
+
+bool bankMatchesRam(const freeink::Uc8253LutBank& ref,
+                    const uint8_t ram[HalDisplay::DEV_LUT_ROLES][HalDisplay::DEV_LUT_LEN]) {
+  return memcmp(ram[0], ref.vcom, HalDisplay::DEV_LUT_LEN) == 0 &&
+         memcmp(ram[1], ref.ww, HalDisplay::DEV_LUT_LEN) == 0 && memcmp(ram[2], ref.bw, HalDisplay::DEV_LUT_LEN) == 0 &&
+         memcmp(ram[3], ref.wb, HalDisplay::DEV_LUT_LEN) == 0 && memcmp(ram[4], ref.bb, HalDisplay::DEV_LUT_LEN) == 0;
+}
+
+void ensureDevLutInitialized() {
+  if (devLutStore.initialized) return;
+  const auto& def = freeink::uc8253X3DefaultConfig();
+  devLutStore.cfg = def;
+  copyBankToRam(def.gc, devLutStore.gcRam);
+  copyBankToRam(def.preBwMid, devLutStore.preBwMidRam);
+  if (def.directGray) {
+    copyBankToRam(*def.directGray, devLutStore.directGrayRam);
+  } else {
+    memset(devLutStore.directGrayRam, 0, sizeof(devLutStore.directGrayRam));
+  }
+  copyBankToRam(def.lut16.preBwMid, devLutStore.lut16PreRam);
+  copyBankToRam(def.lut16.pass1Coarse, devLutStore.lut16Pass1Ram);
+  copyBankToRam(def.lut16.pass2Fine, devLutStore.lut16Pass2Ram);
+  bindRamToBank(devLutStore.gcRam, devLutStore.cfg.gc);
+  bindRamToBank(devLutStore.preBwMidRam, devLutStore.cfg.preBwMid);
+  bindRamToBank(devLutStore.directGrayRam, devLutStore.directGrayBank);
+  devLutStore.cfg.directGray = &devLutStore.directGrayBank;
+  bindRamToBank(devLutStore.lut16PreRam, devLutStore.cfg.lut16.preBwMid);
+  bindRamToBank(devLutStore.lut16Pass1Ram, devLutStore.cfg.lut16.pass1Coarse);
+  bindRamToBank(devLutStore.lut16Pass2Ram, devLutStore.cfg.lut16.pass2Fine);
+  devLutStore.initialized = true;
+}
+
+uint8_t (*selectRamBank(HalDisplay::DevLutBank bank)) [HalDisplay::DEV_LUT_LEN] {
+  switch (bank) {
+    case HalDisplay::DevLutBank::Gc:
+      return devLutStore.gcRam;
+    case HalDisplay::DevLutBank::Pre:
+      return devLutStore.preBwMidRam;
+    case HalDisplay::DevLutBank::Direct:
+      return devLutStore.directGrayRam;
+    case HalDisplay::DevLutBank::Lut16Pre:
+      return devLutStore.lut16PreRam;
+    case HalDisplay::DevLutBank::Lut16Pass1:
+      return devLutStore.lut16Pass1Ram;
+    case HalDisplay::DevLutBank::Lut16Pass2:
+      return devLutStore.lut16Pass2Ram;
+  }
+  return devLutStore.gcRam;
+}
+
+}  // namespace
+
+namespace freeink {
+// Bound by reference inside Uc8253X3Driver so live RAM edits apply on the next SPI LUT load.
+const Uc8253X3Config& crosspointUc8253X3DevConfig() {
+  ensureDevLutInitialized();
+  return devLutStore.cfg;
+}
+}  // namespace freeink
+
+bool HalDisplay::devLutSupported() const {
+#if defined(FREEINK_UC8253_X3_CONFIG)
+  return gpio.deviceIsX3() && getController() == Controller::UC8253;
+#else
+  return false;
+#endif
+}
+
+bool HalDisplay::devLut16Modified() const {
+  if (!devLutSupported()) return false;
+  ensureDevLutInitialized();
+  const auto& def = freeink::uc8253X3DefaultConfig().lut16;
+  const auto& cur = devLutStore.cfg.lut16;
+  if (cur.pllBase != def.pllBase || cur.pllPass1 != def.pllPass1 || cur.pllPass2 != def.pllPass2 ||
+      cur.vdlPass2 != def.vdlPass2) {
+    return true;
+  }
+  return !bankMatchesRam(def.preBwMid, devLutStore.lut16PreRam) ||
+         !bankMatchesRam(def.pass1Coarse, devLutStore.lut16Pass1Ram) ||
+         !bankMatchesRam(def.pass2Fine, devLutStore.lut16Pass2Ram);
+}
+
+bool HalDisplay::devLutModified() const {
+  if (devGrayscaleModeOverride != GrayscaleMode::Overlay || devGray16Mode != DevGray16Mode::Auto ||
+      devSplitReader.enabled) {
+    return true;
+  }
+  if (!devLutSupported()) return false;
+  ensureDevLutInitialized();
+  const auto& def = freeink::uc8253X3DefaultConfig();
+  if (!bankMatchesRam(def.gc, devLutStore.gcRam)) return true;
+  if (!bankMatchesRam(def.preBwMid, devLutStore.preBwMidRam)) return true;
+  if (def.directGray && !bankMatchesRam(*def.directGray, devLutStore.directGrayRam)) return true;
+  return devLut16Modified();
+}
+
+bool HalDisplay::devLutRead(DevLutBank bank, DevLutRole role, uint8_t out[DEV_LUT_LEN]) const {
+  if (!devLutSupported()) return false;
+  const auto roleIdx = static_cast<size_t>(role);
+  if (roleIdx >= DEV_LUT_ROLES) return false;
+  ensureDevLutInitialized();
+  const auto* ram = selectRamBank(bank);
+  memcpy(out, ram[roleIdx], DEV_LUT_LEN);
+  return true;
+}
+
+bool HalDisplay::devLutWriteGroup(DevLutBank bank, DevLutRole role, uint8_t group, uint8_t level, uint8_t tp0,
+                                  uint8_t tp1, uint8_t tp2, uint8_t tp3, uint8_t rp) {
+  if (!devLutSupported()) return false;
+  const auto roleIdx = static_cast<size_t>(role);
+  if (roleIdx >= DEV_LUT_ROLES || group >= DEV_LUT_GROUPS) return false;
+  ensureDevLutInitialized();
+  uint8_t* row = selectRamBank(bank)[roleIdx] + static_cast<size_t>(group) * 6;
+  row[0] = level;
+  row[1] = tp0;
+  row[2] = tp1;
+  row[3] = tp2;
+  row[4] = tp3;
+  row[5] = rp;
+  return true;
+}
+
+bool HalDisplay::devLutWriteTimings(DevLutBank bank, uint8_t group, uint8_t tp0, uint8_t tp1, uint8_t tp2, uint8_t tp3,
+                                    uint8_t rp) {
+  if (!devLutSupported() || group >= DEV_LUT_GROUPS) return false;
+  ensureDevLutInitialized();
+  auto* ram = selectRamBank(bank);
+  const size_t offset = static_cast<size_t>(group) * 6;
+  for (size_t r = 0; r < DEV_LUT_ROLES; ++r) {
+    ram[r][offset + 1] = tp0;
+    ram[r][offset + 2] = tp1;
+    ram[r][offset + 3] = tp2;
+    ram[r][offset + 4] = tp3;
+    ram[r][offset + 5] = rp;
+  }
+  return true;
+}
+
+bool HalDisplay::devLutWriteRaw(DevLutBank bank, DevLutRole role, const uint8_t bytes[DEV_LUT_LEN]) {
+  if (!devLutSupported()) return false;
+  const auto roleIdx = static_cast<size_t>(role);
+  if (roleIdx >= DEV_LUT_ROLES) return false;
+  ensureDevLutInitialized();
+  memcpy(selectRamBank(bank)[roleIdx], bytes, DEV_LUT_LEN);
+  return true;
+}
+
+bool HalDisplay::devLutApplyGcQuick(uint8_t lightTp, uint8_t darkTp, uint8_t lvLight, uint8_t lvDark) {
+  if (!devLutSupported()) return false;
+  ensureDevLutInitialized();
+  memset(devLutStore.gcRam, 0, sizeof(devLutStore.gcRam));
+  const uint8_t levels[DEV_LUT_ROLES] = {0x00, lvDark, lvLight, 0x00, 0x00};
+  for (size_t r = 0; r < DEV_LUT_ROLES; ++r) {
+    devLutStore.gcRam[r][0] = levels[r];
+    devLutStore.gcRam[r][1] = lightTp;
+    devLutStore.gcRam[r][2] = darkTp;
+    devLutStore.gcRam[r][3] = 0;
+    devLutStore.gcRam[r][4] = 0;
+    devLutStore.gcRam[r][5] = 1;
+  }
+  return true;
+}
+
+bool HalDisplay::devLutReset(DevLutBank bank) {
+  if (!devLutSupported()) return false;
+  ensureDevLutInitialized();
+  const auto& def = freeink::uc8253X3DefaultConfig();
+  switch (bank) {
+    case DevLutBank::Gc:
+      copyBankToRam(def.gc, devLutStore.gcRam);
+      return true;
+    case DevLutBank::Pre:
+      copyBankToRam(def.preBwMid, devLutStore.preBwMidRam);
+      return true;
+    case DevLutBank::Direct:
+      if (def.directGray) {
+        copyBankToRam(*def.directGray, devLutStore.directGrayRam);
+      } else {
+        memset(devLutStore.directGrayRam, 0, sizeof(devLutStore.directGrayRam));
+      }
+      return true;
+    case DevLutBank::Lut16Pre:
+      copyBankToRam(def.lut16.preBwMid, devLutStore.lut16PreRam);
+      return true;
+    case DevLutBank::Lut16Pass1:
+      copyBankToRam(def.lut16.pass1Coarse, devLutStore.lut16Pass1Ram);
+      return true;
+    case DevLutBank::Lut16Pass2:
+      copyBankToRam(def.lut16.pass2Fine, devLutStore.lut16Pass2Ram);
+      return true;
+  }
+  return false;
+}
+
+bool HalDisplay::devLut16ReadParams(uint8_t& pllBase, uint8_t& pll1, uint8_t& pll2, uint8_t& vdl2) const {
+  if (!devLutSupported()) return false;
+  ensureDevLutInitialized();
+  pllBase = devLutStore.cfg.lut16.pllBase;
+  pll1 = devLutStore.cfg.lut16.pllPass1;
+  pll2 = devLutStore.cfg.lut16.pllPass2;
+  vdl2 = devLutStore.cfg.lut16.vdlPass2;
+  return true;
+}
+
+bool HalDisplay::devLut16Tune(uint8_t pll1, uint8_t pll2, uint8_t vdl2) {
+  if (!devLutSupported()) return false;
+  ensureDevLutInitialized();
+  devLutStore.cfg.lut16.pllPass1 = static_cast<uint8_t>(pll1 & 0x0Fu);
+  devLutStore.cfg.lut16.pllPass2 = static_cast<uint8_t>(pll2 & 0x0Fu);
+  devLutStore.cfg.lut16.vdlPass2 = static_cast<uint8_t>(vdl2 & 0x3Fu);
+  return true;
+}
+
+bool HalDisplay::devLut16Reset() {
+  if (!devLutSupported()) return false;
+  ensureDevLutInitialized();
+  const auto& def = freeink::uc8253X3DefaultConfig().lut16;
+  devLutStore.cfg.lut16.pllBase = def.pllBase;
+  devLutStore.cfg.lut16.pllPass1 = def.pllPass1;
+  devLutStore.cfg.lut16.pllPass2 = def.pllPass2;
+  devLutStore.cfg.lut16.vdlPass2 = def.vdlPass2;
+  copyBankToRam(def.preBwMid, devLutStore.lut16PreRam);
+  copyBankToRam(def.pass1Coarse, devLutStore.lut16Pass1Ram);
+  copyBankToRam(def.pass2Fine, devLutStore.lut16Pass2Ram);
+  return true;
+}
+
+bool HalDisplay::devIsGray16CleanupActive() const {
+  if (!devLutSupported()) return false;
+  return einkDisplay.isGray16CleanupActive();
+}
+
+bool HalDisplay::devLutResetAll() {
+  devGrayscaleModeOverride = GrayscaleMode::Overlay;
+  devGray16Mode = DevGray16Mode::Auto;
+  devSplitReader = {};
+  if (!devLutSupported()) return false;
+  return devLutReset(DevLutBank::Gc) && devLutReset(DevLutBank::Pre) && devLutReset(DevLutBank::Direct) &&
+         devLut16Reset();
+}
+
+#else
+
+bool HalDisplay::devLutSupported() const { return false; }
+
+bool HalDisplay::devLut16Modified() const { return false; }
+
+bool HalDisplay::devLutModified() const {
+  return devGrayscaleModeOverride != GrayscaleMode::Overlay || devGray16Mode != DevGray16Mode::Auto ||
+         devSplitReader.enabled;
+}
+
+bool HalDisplay::devLutRead(DevLutBank, DevLutRole, uint8_t[DEV_LUT_LEN]) const { return false; }
+
+bool HalDisplay::devLutWriteGroup(DevLutBank, DevLutRole, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t,
+                                  uint8_t) {
+  return false;
+}
+
+bool HalDisplay::devLutWriteTimings(DevLutBank, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t) { return false; }
+
+bool HalDisplay::devLutWriteRaw(DevLutBank, DevLutRole, const uint8_t[DEV_LUT_LEN]) { return false; }
+
+bool HalDisplay::devLutApplyGcQuick(uint8_t, uint8_t, uint8_t, uint8_t) { return false; }
+
+bool HalDisplay::devLutReset(DevLutBank) { return false; }
+
+bool HalDisplay::devLut16ReadParams(uint8_t&, uint8_t&, uint8_t&, uint8_t&) const { return false; }
+
+bool HalDisplay::devLut16Tune(uint8_t, uint8_t, uint8_t) { return false; }
+
+bool HalDisplay::devLut16Reset() { return false; }
+
+bool HalDisplay::devIsGray16CleanupActive() const { return false; }
+
+bool HalDisplay::devLutResetAll() {
+  devGrayscaleModeOverride = GrayscaleMode::Overlay;
+  devGray16Mode = DevGray16Mode::Auto;
+  devSplitReader = {};
+  return false;
+}
+
+#endif
+#endif
