@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <BoardConfig.h>
 #include <EInkDisplay.h>
+#include <GrayscaleCapabilities.h>
 
 class HalDisplay {
  public:
@@ -75,6 +76,7 @@ class HalDisplay {
   bool isInverted() const;
 
   // Power management
+  void powerOffBetweenFrames();
   void deepSleep();
 
   // Access to frame buffer
@@ -108,6 +110,11 @@ class HalDisplay {
   void cleanupGrayscaleBuffers(const uint8_t* bwBuffer);
 
   void displayGrayBuffer(bool turnOffScreen = false);
+  bool supportsGray16() const;
+  void displayGray16Pass1();
+  void displayGray16Pass2(bool turnOffScreen = false);
+  void beginGray16Cleanup(const uint8_t* bwBuffer);
+  void finishGray16Cleanup();
 
   // Tiled grayscale: stream one band of a plane (lsbPlane selects LSB/MSB RAM)
   // straight to the controller; supportsStripGrayscale() gates the path. See

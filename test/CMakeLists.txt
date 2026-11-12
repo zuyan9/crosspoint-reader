@@ -28,6 +28,7 @@ add_library(crosspoint_test_common INTERFACE)
 target_include_directories(crosspoint_test_common INTERFACE
   ${REPO_ROOT}
   ${REPO_ROOT}/lib
+  ${REPO_ROOT}/freeink-sdk/libs/display/FreeInkDisplay/include
 )
 target_compile_options(crosspoint_test_common INTERFACE
   -Wall
@@ -88,6 +89,7 @@ add_subdirectory(sd_card_font)
 add_subdirectory(sd_font_registry)
 add_subdirectory(clipping_preview)
 add_subdirectory(glyph_bitmap)
+add_subdirectory(typography_layout)
 
 add_subdirectory(clipping_store)
 add_subdirectory(reader_session)

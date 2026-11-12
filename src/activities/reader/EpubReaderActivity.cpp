@@ -6,6 +6,7 @@
 #include <FontCacheManager.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
+#include <HalClock.h>
 #include <HalDisplay.h>
 #include <HalFrontlight.h>
 #include <HalGPIO.h>
@@ -22,6 +23,7 @@
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <optional>
 
 #include "../../util/BookmarkFile.h"
 #include "BookmarkEntry.h"
@@ -2100,6 +2102,17 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     ~PxcSlotGuard() { ImageBlock::releaseRenderCache(); }
   } pxcSlotGuard;
 
+  struct StatusBarScope {
+    const EpubReaderActivity& self;
+    StatusBarSnapshot snapshot;
+    const StatusBarSnapshot* prev;
+    explicit StatusBarScope(const EpubReaderActivity& activity)
+        : self(activity), snapshot(activity.buildStatusBarSnapshot()), prev(activity.activeStatusBarSnapshot) {
+      self.activeStatusBarSnapshot = &snapshot;
+    }
+    ~StatusBarScope() { self.activeStatusBarSnapshot = prev; }
+  } statusBarScope{*this};
+
   auto* fcm = renderer.getFontCacheManager();
   auto scope = fcm->createPrewarmScope();
   page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
@@ -2125,19 +2138,54 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   const bool cleanImageBasePending = manualRefreshPending || pagesUntilFullRefresh <= 1;
   const bool needsTextGrayscale = SETTINGS.textAntiAliasing;
   const bool needsAnyGrayscale = needsTextGrayscale || (pageHasImages && !BoardConfig::isEegoA4());
-  const bool absoluteImageGrayscale = pageHasImages && !gpio.deviceIsX3() &&
-                                      display.getController() == HalDisplay::Controller::UC8279 &&
-                                      renderer.grayscaleCapabilities(HalDisplay::GrayscaleMode::Absolute).supported();
+  bool absoluteImageGrayscale = pageHasImages && !gpio.deviceIsX3() &&
+                                display.getController() == HalDisplay::Controller::UC8279 &&
+                                renderer.grayscaleCapabilities(HalDisplay::GrayscaleMode::Absolute).supported();
   const auto grayscale = renderer.grayscaleCapabilities(absoluteImageGrayscale ? HalDisplay::GrayscaleMode::Absolute
                                                                                : HalDisplay::GrayscaleMode::Overlay);
-  const bool tiledGrayscale = needsAnyGrayscale && grayscale.stripUploads;
+  bool runGrayscalePass = needsAnyGrayscale;
+  bool tiledGrayscale = runGrayscalePass && grayscale.stripUploads;
   // Paper Mono only (no other panel combines): defer the B/W base activation so
   // the gray planes join it in a single waveform. Displaying the base
   // separately makes the gray pass re-drive the whole text body — a visible
   // flash on every AA page.
-  const bool combinedGrayscaleBase =
+  bool combinedGrayscaleBase =
       tiledGrayscale && !pageHasImages && grayscale.base == HalDisplay::GrayscaleBase::Combined;
   const bool overlapRefresh = tiledGrayscale && grayscale.asyncBase && !pageHasImages;
+  bool useGray16 =
+      needsTextGrayscale && tiledGrayscale && renderer.supportsGray16() && renderer.has4BitFontForRender(fontId);
+  constexpr int STRIP_ROWS = 80;
+  const int gh = renderer.getDisplayHeight();
+  const int gwBytes = renderer.getDisplayWidthBytes();
+  std::unique_ptr<uint8_t[]> preallocScratch;
+  if (tiledGrayscale && !overlapRefresh) {
+    preallocScratch = makeUniqueNoThrow<uint8_t[]>(static_cast<size_t>(gwBytes) * STRIP_ROWS);
+    if (!preallocScratch) {
+      LOG_ERR("ERS", "OOM: grayscale strip scratch (%d bytes); skipping AA this page", gwBytes * STRIP_ROWS);
+      tiledGrayscale = false;
+      useGray16 = false;
+      runGrayscalePass = false;
+      combinedGrayscaleBase = false;
+      if (absoluteImageGrayscale) {
+        absoluteImageGrayscale = false;
+        renderer.setRenderMode(GfxRenderer::BW);
+      }
+      if (pageHasImages) {
+        renderer.setDitherImagesInBw(true);
+      }
+    }
+  }
+  constexpr int MAX_GRAY16_REFRESH_INTERVAL = 15;
+  if (useGray16 && pagesUntilFullRefresh > MAX_GRAY16_REFRESH_INTERVAL) {
+    pagesUntilFullRefresh = MAX_GRAY16_REFRESH_INTERVAL;
+  }
+  const int targetRefreshInterval = useGray16 ? std::min(SETTINGS.getRefreshFrequency(), MAX_GRAY16_REFRESH_INTERVAL)
+                                              : SETTINGS.getRefreshFrequency();
+  struct Gray16BaseGuard {
+    GfxRenderer& renderer;
+    ~Gray16BaseGuard() { renderer.setGray16Base(false); }
+  } gray16BaseGuard{renderer};
+  renderer.setGray16Base(useGray16);
   auto renderGrayscalePass = [&]() {
     // A4 gray planes replace the full page, including its clipping highlights.
     if (BoardConfig::isEegoA4()) drawClippingHighlights(*page, fontId, orientedMarginTop, orientedMarginLeft);
@@ -2146,8 +2194,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     } else {
       page->renderImages(renderer, fontId, orientedMarginLeft, orientedMarginTop);
     }
-    // A4 replaces the whole frame with its gray planes, including the status bar.
-    if (absoluteImageGrayscale || BoardConfig::isEegoA4()) renderStatusBar();
+    if (useGray16 || absoluteImageGrayscale || BoardConfig::isEegoA4()) renderStatusBar();
   };
 
   if (pageHasImagesNeedingDecode) {
@@ -2164,7 +2211,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
 
   if (absoluteImageGrayscale) {
     const auto baseMode = cleanImageBasePending ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
-    if (!renderer.displayGrayscaleBase(HalDisplay::GrayscaleMode::Absolute, baseMode)) {
+    if (!renderer.displayGrayscaleBase(HalDisplay::GrayscaleMode::Absolute, baseMode, tiledGrayscale)) {
       LOG_ERR("ERS", "Could not start absolute image page; displaying B/W");
       ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
       return;
@@ -2175,23 +2222,29 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     // Image pages use one base refresh before the grayscale pass. FAST leaves
     // the panel receptive to the gray waveform; pending cleanup still honors
     // the scheduled/manual HALF refresh.
-    renderer.displayBuffer(cleanImageBasePending ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH);
+    if (useGray16 && !cleanImageBasePending) {
+      renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH, tiledGrayscale);
+    } else {
+      renderer.displayBuffer(cleanImageBasePending ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH,
+                             tiledGrayscale);
+      if (useGray16) renderer.preconditionGrayscale();
+    }
     pagesUntilFullRefresh = 1;
   } else if (combinedGrayscaleBase) {
     // Stash the base without activating; displayGrayBuffer() below commits
     // base + grays as one waveform.
     ReaderUtils::displayBaseWithRefreshCycle(renderer, pagesUntilFullRefresh);
-  } else if (needsAnyGrayscale) {
+  } else if (runGrayscalePass) {
     if (pagesUntilFullRefresh <= 1) {
       // A cleanup refresh settles X3 correctly only when its grayscale
       // preconditioning waveform runs before the gray planes are written.
-      renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+      renderer.displayBuffer(HalDisplay::HALF_REFRESH, tiledGrayscale);
       renderer.preconditionGrayscale();
-      pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
+      pagesUntilFullRefresh = targetRefreshInterval;
     } else if (overlapRefresh) {
       ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh, /*async=*/true);
     } else {
-      renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
+      renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH, tiledGrayscale);
       pagesUntilFullRefresh--;
     }
   } else {
@@ -2200,9 +2253,6 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   const auto tDisplay = millis();
 
   if (tiledGrayscale) {
-    constexpr int STRIP_ROWS = 80;
-    const int gh = renderer.getDisplayHeight();
-    const int gwBytes = renderer.getDisplayWidthBytes();
     const size_t planeBytes = static_cast<size_t>(gwBytes) * gh;
 
     auto renderPlaneToBuffer = [&](const bool lsbPlane, uint8_t* buf) {
@@ -2255,10 +2305,13 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
               tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tGrayRender - tDisplay, tWait - tGrayRender,
               tGrayWrite - tWait, tGrayDisplay - tGrayWrite, tEnd - tGrayDisplay, tEnd - t0, msbPlaneBuf ? 2 : 1);
     } else {
-      auto scratch = makeUniqueNoThrow<uint8_t[]>(static_cast<size_t>(gwBytes) * STRIP_ROWS);
+      auto scratch = preallocScratch ? std::move(preallocScratch)
+                                     : makeUniqueNoThrow<uint8_t[]>(static_cast<size_t>(gwBytes) * STRIP_ROWS);
       renderer.waitRefreshComplete();
       if (!scratch) {
         LOG_ERR("ERS", "OOM: grayscale strip scratch (%d bytes); skipping AA this page", gwBytes * STRIP_ROWS);
+        if (absoluteImageGrayscale) renderer.setRenderMode(GfxRenderer::BW);
+        bool fallbackDisplayed = false;
         if (overlapRefresh || combinedGrayscaleBase) {
           // The BW refresh ran the shadow-free async path, so controller RAM's
           // differential baseline was never rebuilt. Even with AA skipped it must
@@ -2268,6 +2321,62 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
           // page reaches the panel even without its grays.
           renderer.cleanupGrayscaleWithFrameBuffer();
         }
+        if (SETTINGS.fadingFix != 0 && !fallbackDisplayed) {
+          display.powerOffBetweenFrames();
+        }
+      } else if (useGray16) {
+        const auto streamGray16Plane = [&](const GfxRenderer::RenderMode mode, const bool lsbPlane) {
+          renderer.setRenderMode(mode);
+          for (int y = 0; y < gh; y += STRIP_ROWS) {
+            const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
+            renderer.beginStripTarget(scratch.get(), y, rows);
+            renderer.clearScreen(0x00);
+            renderGrayscalePass();
+            renderer.endStripTarget();
+            renderer.writeGrayscalePlaneStrip(lsbPlane, scratch.get(), y, rows);
+          }
+        };
+
+        streamGray16Plane(GfxRenderer::GRAY16_COARSE_LSB, true);
+        streamGray16Plane(GfxRenderer::GRAY16_COARSE_MSB, false);
+        renderer.setRenderMode(GfxRenderer::BW);
+        renderer.displayGray16Pass1();
+        const auto tPass1 = millis();
+
+        streamGray16Plane(GfxRenderer::GRAY16_FINE_LSB, true);
+        streamGray16Plane(GfxRenderer::GRAY16_FINE_MSB, false);
+        renderer.setRenderMode(GfxRenderer::BW);
+        renderer.displayGray16Pass2();
+        const auto tPass2 = millis();
+
+        // Post-pass differential baseline: DTM2 holds Gray16BW, while DTM1 and
+        // frameBuffer both receive CleanupDTM1 so later FAST_REFRESH overlays match DTM1.
+        renderer.beginGray16Cleanup();
+        renderer.setRenderMode(GfxRenderer::GRAY16_CLEANUP_DTM1);
+        uint8_t* const fb = renderer.getFrameBuffer();
+        for (int y = 0; y < gh; y += STRIP_ROWS) {
+          const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
+          const size_t stripBytes = static_cast<size_t>(rows) * gwBytes;
+          renderer.beginStripTarget(scratch.get(), y, rows);
+          renderer.clearScreen(0xFF);
+          drawClippingHighlights(*page, fontId, orientedMarginTop, orientedMarginLeft);
+          page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
+          renderStatusBar();
+          renderer.endStripTarget();
+          renderer.writeGrayscalePlaneStrip(true, scratch.get(), y, rows);
+          if (fb) {
+            memcpy(fb + static_cast<size_t>(y) * gwBytes, scratch.get(), stripBytes);
+          }
+        }
+        renderer.setRenderMode(GfxRenderer::BW);
+        renderer.finishGray16Cleanup();
+        const auto tCleanup = millis();
+
+        LOG_DBG("ERS",
+                "Page render (X3 16-gray 2-pass): prewarm=%lums bw_render=%lums base=%lums "
+                "pass1=%lums pass2=%lums cleanup=%lums total=%lums",
+                tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tPass1 - tDisplay, tPass2 - tPass1,
+                tCleanup - tPass2, tCleanup - t0);
       } else {
         renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
         for (int y = 0; y < gh; y += STRIP_ROWS) {
@@ -2307,7 +2416,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       }
     }
   } else {
-    if (needsAnyGrayscale) {
+    if (runGrayscalePass) {
       if (!renderer.storeBwBuffer()) {
         LOG_ERR("ERS", "Failed to store BW buffer for grayscale render; skipping grayscale this page");
         if (absoluteImageGrayscale) renderer.setRenderMode(GfxRenderer::BW);
@@ -2469,46 +2578,69 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
 }
 
 void EpubReaderActivity::renderStatusBar() const {
-  const int currentPage = section ? section->currentPage + 1 : 1;
-  const float pageCount = section ? section->estimatedTotalPages() : 1;
-  const float sectionChapterProg = (pageCount > 0) ? (static_cast<float>(currentPage) / pageCount) : 0;
-  const float bookProgress = epub ? (epub->calculateProgress(currentSpineIndex, sectionChapterProg) * 100) : 0;
+  if (activeStatusBarSnapshot) {
+    const StatusBarSnapshot& s = *activeStatusBarSnapshot;
+    GUI.drawStatusBar(renderer, s.bookProgress, s.currentPage, s.pageCount, s.title, 0, s.textYOffset, true,
+                      s.bookmarked, s.isBuilding);
+    return;
+  }
+  const StatusBarSnapshot s = buildStatusBarSnapshot();
+  GUI.drawStatusBar(renderer, s.bookProgress, s.currentPage, s.pageCount, s.title, 0, s.textYOffset, true, s.bookmarked,
+                    s.isBuilding);
+}
 
-  std::string title;
-  int textYOffset = 0;
+EpubReaderActivity::StatusBarSnapshot EpubReaderActivity::buildStatusBarSnapshot(const bool recordLinkNote) const {
+  StatusBarSnapshot snapshot;
+  snapshot.currentPage = section ? section->currentPage + 1 : 1;
+  snapshot.pageCount = section ? section->estimatedTotalPages() : 1;
+  const float sectionChapterProg =
+      (snapshot.pageCount > 0) ? (static_cast<float>(snapshot.currentPage) / static_cast<float>(snapshot.pageCount))
+                               : 0.0f;
+  snapshot.bookProgress = epub ? (epub->calculateProgress(currentSpineIndex, sectionChapterProg) * 100.0f) : 0.0f;
+  snapshot.bookmarked = currentPageBookmarked;
+  snapshot.isBuilding = section ? section->isBuilding() : false;
+
   const auto sb = SETTINGS.statusBarSpec();
+  if (sb.showsClock() && halClock.isAvailable()) {
+    char clockBuf[9];
+    halClock.formatTime(clockBuf, sizeof(clockBuf), sb.clock12h);
+  }
 
-  const auto note = linkNoteTitle.draw(sb.showsTitle(), bleturner::linkNote());
+  const auto note = recordLinkNote ? linkNoteTitle.draw(sb.showsTitle(), bleturner::linkNote())
+                                   : (sb.showsTitle() ? bleturner::linkNote() : bleturner::LinkNote::None);
   if (note == bleturner::LinkNote::Connected) {
     const auto peer = bleturner::linked();
     char connected[64];
     snprintf(connected, sizeof(connected), tr(STR_BT_CONNECTED_TO), peer.name[0] != '\0' ? peer.name : peer.addr);
-    title = connected;
+    snapshot.title = connected;
   } else if (note == bleturner::LinkNote::LowMemory) {
-    title = tr(STR_BT_LOW_MEMORY);
+    snapshot.title = tr(STR_BT_LOW_MEMORY);
   } else if (note != bleturner::LinkNote::None) {
-    title = note == bleturner::LinkNote::Connecting ? tr(STR_BT_CONNECTING) : tr(STR_BT_FAILED);
+    snapshot.title = note == bleturner::LinkNote::Connecting ? tr(STR_BT_CONNECTING) : tr(STR_BT_FAILED);
   } else if (automaticPageTurnActive) {
-    title = tr(STR_AUTO_TURN_ENABLED) + std::to_string(60 * 1000 / pageTurnDuration);
+    char autoBuf[64];
+    snprintf(autoBuf, sizeof(autoBuf), "%s%lu", tr(STR_AUTO_TURN_ENABLED),
+             pageTurnDuration > 0 ? (60000UL / pageTurnDuration) : 0UL);
+    snapshot.title = autoBuf;
     const uint8_t statusBarHeight = UITheme::getInstance().getStatusBarHeight();
     if (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight()) {
-      textYOffset += UITheme::getInstance().getMetrics().statusBarVerticalMargin;
+      snapshot.textYOffset += UITheme::getInstance().getMetrics().statusBarVerticalMargin;
     }
   } else if (sb.titleMode == CrossPointSettings::STATUS_BAR_TITLE::CHAPTER_TITLE) {
-    title = tr(STR_UNNAMED);
+    snapshot.title = tr(STR_UNNAMED);
     if (epub) {
       const int tocIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
       if (tocIndex != -1) {
-        const auto tocItem = epub->getTocItem(tocIndex);
-        title = tocItem.title;
+        snapshot.title = epub->getTocItem(tocIndex).title;
       }
     }
   } else if (sb.titleMode == CrossPointSettings::STATUS_BAR_TITLE::BOOK_TITLE) {
-    title = epub ? epub->getTitle() : "";
+    if (epub) {
+      snapshot.title = epub->getTitle();
+    }
   }
 
-  GUI.drawStatusBar(renderer, bookProgress, currentPage, pageCount, title, 0, textYOffset, true, currentPageBookmarked,
-                    section ? section->isBuilding() : false);
+  return snapshot;
 }
 
 // ---------------------------------------------------------------------------

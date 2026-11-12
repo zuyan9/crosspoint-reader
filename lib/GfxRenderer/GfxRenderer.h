@@ -34,7 +34,16 @@ enum Color : uint8_t { Clear = 0x00, White = 0x01, LightGray = 0x05, DarkGray = 
 
 class GfxRenderer {
  public:
-  enum RenderMode { BW, GRAYSCALE_LSB, GRAYSCALE_MSB };
+  enum RenderMode {
+    BW,
+    GRAYSCALE_LSB,
+    GRAYSCALE_MSB,
+    GRAY16_COARSE_LSB,
+    GRAY16_COARSE_MSB,
+    GRAY16_FINE_LSB,
+    GRAY16_FINE_MSB,
+    GRAY16_CLEANUP_DTM1
+  };
   enum class DitherMode { Replace, PreserveInk };
 
   // Logical screen orientation from the perspective of callers
@@ -51,6 +60,7 @@ class GfxRenderer {
   HalDisplay& display;
   RenderMode renderMode;
   mutable bool absoluteGrayPlanes = false;
+  mutable bool gray16BaseActive_ = false;
   bool ditherImagesInBw = false;
   Orientation orientation;
   bool fadingFix;
@@ -233,7 +243,7 @@ class GfxRenderer {
   int getScreenWidth() const;
   int getScreenHeight() const;
   void tapToLogical(float nx, float ny, int& outX, int& outY) const;
-  void displayBuffer(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
+  void displayBuffer(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH, bool keepPowered = false) const;
   // One-shot: the next displayBuffer(), displayBufferAsync(), or
   // displayGrayscaleBase() call uses `mode`
   // instead of what its caller asked for, then the override clears itself.
@@ -305,6 +315,8 @@ class GfxRenderer {
   }
   void drawPixel(int x, int y, bool state = true) const;
   // Draw glyph ink with clipping and orientation resolved once per glyph.
+  void drawGlyphBitmap(const uint8_t* bitmap, int width, int height, const glyphBitmap::Frame& frame,
+                       uint8_t bitsPerPixel, RenderMode mode, bool state) const;
   void drawGlyphBitmap(const uint8_t* bitmap, int width, int height, const glyphBitmap::Frame& frame, bool twoBit,
                        RenderMode mode, bool state) const;
   void drawLine(int x1, int y1, int x2, int y2, bool state = true) const;
@@ -342,7 +354,8 @@ class GfxRenderer {
   void writeFramebufferRegion(int x, int y, int w, int h, const uint8_t* src);
 
   // Text
-  // Layout may use advance-only SD font tables; rendered measurement includes kerning and ligatures.
+  // Both modes include kerning, ligatures, and cumulative fp4 pen tracking; Layout also consults
+  // cached SD-font advance tables before glyph lookup.
   enum class TextMeasureMode { Layout, Rendered };
   int getTextWidth(int fontId, const char* text, EpdFontFamily::Style style = EpdFontFamily::REGULAR,
                    BidiUtils::BidiBaseDir baseDir = BidiUtils::BidiBaseDir::AUTO) const;
@@ -389,6 +402,13 @@ class GfxRenderer {
   // Grayscale functions
   void setRenderMode(RenderMode mode);
   RenderMode getRenderMode() const { return renderMode; }
+  // When true during RenderMode::BW, 4bpp glyphs paint all non-zero nibbles (ink 1..15)
+  // black so the 2-pass 16-gray bleaches can lift ink=1 to Gray 14; when false (1-pass
+  // 4-gray or plain B/W), Plane::BW suppresses sub-threshold ink=1 halo (0xFFFC).
+  void setGray16Base(bool enabled) const { gray16BaseActive_ = enabled; }
+  bool isGray16Base() const { return gray16BaseActive_; }
+  bool isFont4Bit(int fontId, EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
+  bool has4BitFontForRender(int fontId) const;
   // Grayscale preconditioning settle pass (no-op on X4). The rect overload
   // takes the gray region in LOGICAL screen coordinates and rotates it to the
   // panel; the no-arg overload settles the full frame. Call after the BW base
@@ -398,12 +418,18 @@ class GfxRenderer {
   // Display the framebuffer as the base frame for a grayscale overlay that
   // follows (X3: OEM differential base waveform; others: plain display with
   // `fallback`).
-  void displayGrayscaleBase(HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH) const;
-  bool displayGrayscaleBase(HalDisplay::GrayscaleMode mode,
-                            HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH) const;
+  void displayGrayscaleBase(HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH,
+                            bool keepPowered = false) const;
+  bool displayGrayscaleBase(HalDisplay::GrayscaleMode mode, HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH,
+                            bool keepPowered = false) const;
   void copyGrayscaleLsbBuffers() const;
   void copyGrayscaleMsbBuffers() const;
   void displayGrayBuffer() const;
+  bool supportsGray16() const;
+  void displayGray16Pass1() const;
+  void displayGray16Pass2() const;
+  void beginGray16Cleanup() const;
+  void finishGray16Cleanup() const;
   // Active input encoding, used when drawing monochrome overlays into planes.
   bool grayPlanesAreAbsolute() const { return absoluteGrayPlanes; }
   // B/W pass: draw 2-bit image pixels as a 2x2 ordered dither instead of

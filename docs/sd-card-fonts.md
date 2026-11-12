@@ -82,10 +82,13 @@ file in the same family folder takes priority over TTF/OTF/TTC files, so keep
 the two formats in separate folders. If both font roots contain the same family
 name, the copy in `/.fonts/` takes priority.
 
-Direct fonts use the standard reader sizes: 12, 14, 16, and 18 pt. The **Fonts**
-tab in File Transfer accepts `.cpfont` files only. Copy direct fonts to the SD
-card instead. To remove a loose font file, delete that file from the SD card.
-The Fonts page can delete families stored in subfolders.
+Direct fonts use the standard reader sizes: 12, 14, 16, and 18 pt. Reader faces
+rasterize at 4-bit grayscale in RAM and render in 4-level grayscale when **Text
+Anti-Aliasing** is on, or in monochrome when it is off or on monochrome panels;
+UI fallback sizes stay 2-bit. The **Fonts** tab in File Transfer accepts
+`.cpfont` files only. Copy direct fonts to the SD card instead. To remove a
+loose font file, delete that file from the SD card. The Fonts page can delete
+families stored in subfolders.
 
 ## Non-Latin Scripts Fallback in the User Interface
 
@@ -227,6 +230,25 @@ To list all presets with codepoint counts:
 
 ### Additional options
 
-`--force-autohint` — force FreeType's auto-hinter instead of the font's native hinting (useful when a font's built-in hints produce poor results at small sizes).
+- `--force-autohint` — force FreeType's auto-hinter instead of the font's native hinting (useful when a font's built-in hints produce poor results at small sizes).
+- `-4`, `--4bit` — emit 4-bit (16-level, MSB-nibble-first) glyph bitmaps (`flags = 0x0002`) instead of the default 2-bit (`-2`, `--2bit`, `flags = 0x0001`).
+- `--gamma <value>` — apply reflectance-space quantization gamma `1 - (1 - a/255)^gamma` (default `1.0`, leaving standard 2-bit output unchanged; `--gamma 1.2` is tuned for two-pass 16-gray `.cpfont` refresh on **Xteink X3 (UC8253 panel)** when **Text Anti-Aliasing** is enabled and **Night Mode** is off; other panels and **Night Mode** fall back to 4-gray or monochrome).
+
+### 4-bit (16-level) `.cpfont` files
+
+Pass `--4bit` (optionally with `--gamma 1.2`) to `fontconvert_sdcard.py` to build 4-bit `.cpfont` v4 files (`flags = 0x0002`; see [file-formats.md](file-formats.md)):
+
+    python3 lib/EpdFont/scripts/fontconvert_sdcard.py \
+      --regular MyFont-Regular.ttf \
+      --bold MyFont-Bold.ttf \
+      --italic MyFont-Italic.ttf \
+      --bolditalic MyFont-BoldItalic.ttf \
+      --intervals latin-ext \
+      --sizes 12,14,16,18 \
+      --4bit --gamma 1.2 \
+      --name MyFont \
+      --output-dir ./MyFont/
+
+**Xteink X3 (UC8253 panel)** runs a two-pass 16-gray refresh for 4-bit `.cpfont` files when **Text Anti-Aliasing** is enabled and **Night Mode** is off, while other panels (including UC8279 X3, X4, and external-RAM boards), **Night Mode**, and turning anti-aliasing off fall back to single-pass 4-gray or monochrome rendering; two-pass 16-gray text refreshes run a cleanup refresh at least every 15 pages even if **Refresh Frequency** is set higher. Older firmware versions without 4-bit `.cpfont` support reject `flags = 0x0002` files and report `"Damaged font file"`.
 
 Install custom fonts via the web interface or manual SD card copy.

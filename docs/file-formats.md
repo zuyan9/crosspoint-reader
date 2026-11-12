@@ -90,6 +90,31 @@ if (parsedSize != fileSize) {
 
 ## `section.bin`
 
+### Version 77
+
+Version 77 keeps the binary layout and rebuilds completed and partial sections.
+Justified left-to-right lines now apply optical margin alignment (`1–3 px`
+hanging punctuation at line edges), which can change cached line breaks and word
+positions. Clipping layout signatures also bump `LAYOUT_SIGNATURE_VERSION`
+(`2 -> 3`) so older page-local clipping word ranges do not match rebuilt pages.
+Book metadata and saved progress are kept.
+
+### Version 76
+
+Version 76 keeps the binary layout and rebuilds completed and partial sections.
+SD-card `.cpfont` layout now applies ligatures and kerning to match rendering,
+glyph placement and width measurement share cumulative `fp4` pen tracking,
+justified lines distribute remainder pixels across word gaps with a maximum
+space-stretch guard, and paragraph wrapping uses `2/3` English hyphenation with
+bounded Knuth–Plass dynamic programming. Book metadata and saved progress are
+kept.
+
+### Version 75
+
+Version 75 keeps the binary layout and rebuilds completed and partial sections
+so headings (`h1`–`h6`) are not hyphenated. Clipping layout signatures bump
+`LAYOUT_SIGNATURE_VERSION` (`1 -> 2`). Book metadata and saved progress are kept.
+
 ### Version 74
 
 Version 74 keeps the binary layout and rebuilds completed and partial sections.
@@ -772,3 +797,27 @@ Book moves rename the store and its `.deleted` journal (plus recovery sidecars)
 together. The stored source path is informational and is refreshed on the next
 save; the current file path selects the store. Local book deletion cleans up all
 of these sidecars but preserves the independent `My Clippings.txt` export.
+
+## `.cpfont` — SD-card bitmap font (`/.fonts/<Family>/<Family>_<pt>.cpfont`)
+
+Version 4 (`CPFONT\0\0`, `version = 4`). Each file starts with a 32-byte little-endian
+header followed by `styleCount` 32-byte table-of-contents entries (`styleId` `0..3`:
+regular, bold, italic, bold italic) and each style's intervals, `EpdGlyph` entries,
+packed kerning class tables, dense kerning matrix, ligature pairs, and packed glyph
+bitmaps.
+
+Header `flags` (`uint16_t` at byte offset `10`) selects the glyph bitmap bit depth:
+
+| `flags` | Encoding | Packed bytes per glyph |
+|---|---|---|
+| `0x0000` | 1-bit monochrome, MSB-first (`0` = background, `1` = ink) | `(width * height + 7) / 8` |
+| `0x0001` | 2-bit grayscale (4 levels, `0` = background .. `3` = black), MSB-first (`fontconvert_sdcard.py` default / `--2bit`) | `(width * height + 3) / 4` |
+| `0x0002` | 4-bit grayscale (16 levels, `0` = background .. `15` = black), MSB-nibble-first (`fontconvert_sdcard.py --4bit`) | `(width * height + 1) / 2` |
+
+Setting both `0x0001` and `0x0002` is invalid and rejected on load. Firmware versions
+before 4-bit `.cpfont` support reject `flags = 0x0002` and report `"Damaged font file"`.
+**Xteink X3 (UC8253 panel)** runs the two-pass 16-gray refresh for 4-bit `.cpfont` files
+when **Text Anti-Aliasing** is enabled and **Night Mode** is off, while other panels
+(including UC8279 X3, X4, and external-RAM boards) and **Night Mode** fall back to
+single-pass 4-gray or monochrome rendering (direct `.ttf`/`.otf`/`.ttc` reader fonts on
+external-RAM boards rasterize at 4-bit and render in 4-level grayscale or monochrome).

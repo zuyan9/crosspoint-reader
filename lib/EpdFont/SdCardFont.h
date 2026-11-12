@@ -1,5 +1,7 @@
 #pragma once
 
+#include <HalStorage.h>
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -27,6 +29,15 @@ class SdCardFont {
   // Distinct from a missed-glyph count so the caller can retry smaller.
   static constexpr int PREWARM_ARENA_TOO_LARGE = -2;
   static constexpr uint8_t MAX_STYLES = 4;
+  static constexpr uint16_t CPFONT_FLAG_2BIT = 0x0001;
+  static constexpr uint16_t CPFONT_FLAG_4BIT = 0x0002;
+  static constexpr uint32_t MINI_SLAB_SHIFT = 13;
+  static constexpr uint32_t MINI_SLAB_SIZE = 1u << MINI_SLAB_SHIFT;  // 8,192 B non-straddling slabs
+  static constexpr uint32_t MINI_SLAB_MASK = MINI_SLAB_SIZE - 1u;
+  static constexpr uint8_t MAX_MINI_SLABS = 16;
+  static constexpr uint8_t MAX_NO_PSRAM_SLABS = 4;  // <= 32 KB resident 4bpp cap on ESP32-C3
+  // Marks a resident EpdGlyph entry whose bitmap spilled past the slab cap and faults via overflow_.
+  static constexpr uint32_t SPILLED_BITMAP_FLAG = 0x80000000u;
 
   SdCardFont() = default;
   ~SdCardFont();
@@ -84,8 +95,16 @@ class SdCardFont {
   // Returns the 12.4 fixed-point advance, or 0 if not found.
   uint16_t getAdvance(uint32_t codepoint, uint8_t style) const;
 
-  // Returns true if advance table is populated for at least one style.
+  // Returns true if advance table is populated for at least one style (or for the resolved `style`).
   bool hasAdvanceTable() const;
+  bool hasAdvanceTable(uint8_t style) const;
+
+  // Retain an open read-only file handle across an active render PrewarmScope.
+  void beginPrewarmScope() { scopeActive_ = true; }
+  bool isMiniMetadataOnly(uint8_t style = 0) const;
+  bool needsKernLigPrewarm(uint8_t style, const char* utf8Text) const;
+  bool needsMetadataPrewarm(uint8_t style, const char* utf8Text) const;
+  bool needsRenderPrewarm(uint8_t style, const char* utf8Text) const;
 
   // Free mini data for all styles and restore stub EpdFontData.
   // Preserves the persistent advance cache so repeated layout passes can reuse
@@ -122,15 +141,11 @@ class SdCardFont {
   // Number of styles present in this font file.
   uint8_t styleCount() const { return styleCount_; }
 
-  // Returns true if the glyph pointer points into the overflow buffer.
-  bool isOverflowGlyph(const EpdGlyph* glyph) const;
-
-  // Returns the bitmap for an on-demand-loaded (overflow) glyph.
-  const uint8_t* getOverflowBitmap(const EpdGlyph* glyph) const;
-
-  // Extract SdCardFont* from an opaque glyphMissCtx pointer.
-  // Used by GfxRenderer::getGlyphBitmap() to recover the SdCardFont from EpdFontData::glyphMissCtx.
-  static SdCardFont* fromMissCtx(void* ctx);
+  // Resolve bitmap pointer for any glyph of this SdCardFont (overflow LRU slot,
+  // 8 KB non-straddling 4bpp slab, spilled 4bpp glyph, or contiguous miniBitmap).
+  static const uint8_t* resolveGlyphBitmap(void* ctx, const EpdGlyph* glyph);
+  const uint8_t* getGlyphBitmap(const EpdGlyph* glyph, uint8_t style = 0) const;
+  bool is4Bit(uint8_t style = 0) const;
 
   // True once after a loaded font first hits a corrupt glyph entry, so the UI can tell the user.
   static bool takeCorruptGlyphNotice() { return corruptGlyphNotice_.exchange(false); }
@@ -159,6 +174,7 @@ class SdCardFont {
     int16_t ascender = 0;
     int16_t descender = 0;
     bool is2Bit = false;
+    bool is4Bit = false;
     uint16_t kernLeftEntryCount = 0;
     uint16_t kernRightEntryCount = 0;
     uint8_t kernLeftClassCount = 0;
@@ -228,11 +244,16 @@ class SdCardFont {
     EpdUnicodeInterval* miniIntervals = nullptr;
     EpdGlyph* miniGlyphs = nullptr;
     uint8_t* miniBitmap = nullptr;
+    uint8_t* miniBitmapSlabs[MAX_MINI_SLABS] = {};
     uint32_t miniIntervalCount = 0;
     uint32_t miniGlyphCount = 0;
     uint32_t miniIntervalCapacity = 0;
     uint32_t miniGlyphCapacity = 0;
     uint32_t miniBitmapCapacity = 0;
+    uint8_t miniBitmapSlabsAllocated = 0;
+    uint8_t miniBitmapSlabsUsed = 0;
+    bool miniSlabCapped = false;
+    uint16_t miniSpilledCount = 0;
     // Bitmap bytes the current page actually used (set by prewarmStyle), the
     // underuse-hysteresis signal; 0 = no bitmap built this scope (metadata-only
     // prewarm), which leaves the hysteresis counter untouched.
@@ -290,17 +311,22 @@ class SdCardFont {
   };
   OverflowContext overflowCtx_[MAX_STYLES] = {};
 
-  // Shared on-demand overflow buffer (ring buffer of glyphs loaded via glyphMissHandler)
-  static constexpr uint32_t OVERFLOW_CAPACITY = 8;
+  // Shared on-demand overflow buffer (LRU cache of glyphs loaded via glyphMissHandler)
+  static constexpr uint32_t OVERFLOW_CAPACITY = 16;
   struct OverflowEntry {
     EpdGlyph glyph;
     uint8_t* bitmap = nullptr;
     uint32_t codepoint = 0;
+    uint32_t bitmapOffset = UINT32_MAX;
+    uint32_t lastAccess = 0;
     uint8_t styleIdx = 0;
   };
   OverflowEntry overflow_[OVERFLOW_CAPACITY] = {};
   uint32_t overflowCount_ = 0;
-  uint32_t overflowNext_ = 0;
+  uint32_t overflowClock_ = 0;
+
+  HalFile cachedReadFile_;
+  bool scopeActive_ = false;
 
   // Compact advance-only table for layout measurement (per-style).
   // Built by buildAdvanceTable(), queried by getAdvance().
@@ -347,6 +373,10 @@ class SdCardFont {
   void applyKernLigaturePointers(PerStyle& s, EpdFontData& data) const;
   void applyGlyphMissCallback(uint8_t styleIdx);
   int32_t findGlobalGlyphIndex(const PerStyle& s, uint32_t codepoint) const;
+  static int32_t findMiniGlyphIndex(const PerStyle& s, uint32_t codepoint);
+  const uint8_t* loadSpilledBitmap(uint8_t styleIdx, const EpdGlyph& glyph);
+  HalFile* openOrReuseReadFile(HalFile& localFallback);
+  void closeCachedReadFile();
   // Drops this style's reference to its interval table and frees the table with the last one.
   static void releaseIntervals(PerStyle& s);
   // False for a glyph entry the file cannot back (a corrupt .cpfont): its data length must be the

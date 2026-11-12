@@ -85,14 +85,97 @@ void appendShapedRtlTokens(const char* text, std::string& shapedOut) {
     }
   }
 }
+
+bool containsNonCjkKernCandidate(const char* text) {
+  const auto* p = reinterpret_cast<const unsigned char*>(text);
+  while (*p) {
+    const uint32_t cp = utf8NextCodepoint(&p);
+    if (cp == 0) break;
+    if (!utf8IsCjkBreakable(cp) && !utf8IsCombiningMark(cp) && !BidiUtils::isTransparentMark(cp)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Warms non-CJK codepoints into SdCardFont's metadata-only mini kern/ligature tables
+// so layout measurement sees the exact same ligature substitutions and class kerning as
+// drawText() without allocating glyph bitmaps or evicting advanceTable_.
+void warmSdCardKernAndLigatures(SdCardFont& sdFont, const char* const* segments, const size_t* segmentLens,
+                                const size_t segmentCount, const char* extraText, const uint8_t styleMask,
+                                const bool includeSmallCaps) {
+  constexpr size_t MAX_KERN_LIG_CPS = 256;
+  constexpr size_t SCRATCH_BYTES = MAX_KERN_LIG_CPS * sizeof(uint32_t) + MAX_KERN_LIG_CPS * 4 + 4;
+  auto scratch = makeUniqueNoThrow<uint8_t[]>(SCRATCH_BYTES);
+  if (!scratch) {
+    LOG_ERR("GFX", "OOM: SD kern/lig scratch (%u bytes)", static_cast<unsigned>(SCRATCH_BYTES));
+    return;
+  }
+  auto* cps = reinterpret_cast<uint32_t*>(scratch.get());
+  char* utf8Buf = reinterpret_cast<char*>(cps + MAX_KERN_LIG_CPS);
+  size_t cpCount = 0;
+  bool sawNonCjkInput = false;
+
+  const auto addCp = [&](const uint32_t cp) {
+    if (cp == 0 || utf8IsCjkBreakable(cp) || utf8IsCombiningMark(cp) || BidiUtils::isTransparentMark(cp)) {
+      return;
+    }
+    for (size_t i = 0; i < cpCount; ++i) {
+      if (cps[i] == cp) return;
+    }
+    if (cpCount < MAX_KERN_LIG_CPS) {
+      cps[cpCount++] = cp;
+    }
+  };
+
+  // Reserve space and hyphen up front so the 256-codepoint cap never drops them.
+  addCp(' ');
+  addCp('-');
+
+  const auto scanString = [&](const char* s) {
+    const auto* p = reinterpret_cast<const unsigned char*>(s);
+    while (*p) {
+      const uint32_t cp = utf8NextCodepoint(&p);
+      if (cp == 0) break;
+      if (!utf8IsCjkBreakable(cp) && !utf8IsCombiningMark(cp) && !BidiUtils::isTransparentMark(cp)) {
+        sawNonCjkInput = true;
+      }
+      addCp(cp);
+      if (includeSmallCaps) {
+        const uint32_t upper = utf8SmallCapsUpper(cp);
+        if (upper != cp) addCp(upper);
+      }
+    }
+  };
+
+  for (size_t seg = 0; seg < segmentCount; ++seg) {
+    const char* p = segments[seg];
+    if (!p) continue;
+    const char* const end = p + segmentLens[seg];
+    while (p < end) {
+      scanString(p);
+      p += strlen(p) + 1;
+    }
+  }
+  if (extraText) {
+    scanString(extraText);
+  }
+  if (!sawNonCjkInput) {
+    return;
+  }
+
+  char* out = utf8Buf;
+  for (size_t i = 0; i < cpCount; ++i) {
+    out = utf8AppendCodepoint(out, cps[i]);
+  }
+  *out = '\0';
+  sdFont.prewarm(utf8Buf, styleMask, /*metadataOnly=*/true, /*loadKernLig=*/true, /*accumulate=*/true);
+}
 }  // namespace
 
 const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const EpdGlyph* glyph) const {
-  // Vector (TTF) fonts: the glyph bitmap lives in the font's own cache, keyed by
-  // the EpdGlyph the miss handler returned. Checked first so it never reaches the
-  // SdCardFont overflow cast below. nullptr = zero-width glyph (e.g. space).
-  if (fontData->vectorBitmapHandler != nullptr) {
-    return fontData->vectorBitmapHandler(fontData->glyphMissCtx, glyph);
+  if (fontData->bitmapHandler != nullptr) {
+    return fontData->bitmapHandler(fontData->glyphMissCtx, glyph);
   }
   if (fontData->groups != nullptr) {
     auto* fd = fontCacheManager_ ? fontCacheManager_->getDecompressor() : nullptr;
@@ -106,58 +189,37 @@ const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const Ep
     // must consume it (draw the glyph) before requesting another bitmap.
     return fd->getBitmap(fontData, glyph, glyphIndex);
   }
-  // For SD card fonts, check if the glyph was loaded on demand into the overflow
-  // buffer.  getOverflowBitmap() returns:
-  //   - bitmap pointer for overflow glyphs with bitmap data
-  //   - nullptr for overflow glyphs without bitmap data (e.g. space: width=0, height=0)
-  //   - nullptr for non-overflow glyphs (normal prewarmed path)
-  // We distinguish overflow-with-no-bitmap from non-overflow by checking isOverflowGlyph().
-  if (fontData->glyphMissCtx) {
-    auto* sdFont = SdCardFont::fromMissCtx(fontData->glyphMissCtx);
-    if (sdFont->isOverflowGlyph(glyph)) {
-      return sdFont->getOverflowBitmap(glyph);  // may be nullptr for zero-width glyphs
-    }
-  }
+  if (!fontData->bitmap || glyph->dataLength == 0) return nullptr;
   return &fontData->bitmap[glyph->dataOffset];
 }
 
 void GfxRenderer::ensureSdCardFontReady(int fontId, const char* utf8Text, uint8_t styleMask) const {
-  auto it = sdCardFonts_.find(fontId);
-  if (it != sdCardFonts_.end()) {
-    std::string shaped;
-    appendShapedRtlTokens(utf8Text, shaped);
-    int missed = it->second->buildAdvanceTable(utf8Text, styleMask, shaped.empty() ? nullptr : shaped.c_str());
-    if (missed > 0) {
-      LOG_DBG("GFX", "ensureSdCardFontReady: %d glyph(s) not found", missed);
-    }
-    return;
-  }
-  // TTF (vector) fonts need nothing here: getGlyph faults glyphs in on demand
-  // (glyphMissHandler), and the page's set is batch-warmed by the render scan's
-  // prewarmCache(). Pre-faulting a whole chapter's text during layout would just
-  // thrash the page-bounded cache, so it is intentionally omitted.
+  if (!utf8Text || *utf8Text == '\0') return;
+  const size_t len = strlen(utf8Text);
+  ensureSdCardFontReady(fontId, &utf8Text, &len, 1, false, false, styleMask, false);
 }
 
 void GfxRenderer::ensureSdCardFontReady(const int fontId, const char* const* segments, const size_t* segmentLens,
                                         const size_t segmentCount, const bool includeSpace, const bool includeHyphen,
                                         const uint8_t styleMask, const bool includeSmallCaps) const {
   auto it = sdCardFonts_.find(fontId);
-  if (it != sdCardFonts_.end()) {
-    // Augment the persistent advance-only table for layout measurement.
-    // The table survives across paragraphs/sections (capped per font), so
-    // repeated indexing of the same SD font amortizes glyph-metric SD reads.
-    std::string shaped;
+  if (it != sdCardFonts_.end() && it->second != nullptr) {
+    // Augment the persistent advance-only table for layout measurement, then warm
+    // non-CJK ligatures and class kerning so layout matches drawText() pixel-for-pixel.
+    std::string extra;
     for (size_t seg = 0; seg < segmentCount; seg++) {
       const char* p = segments[seg];
+      if (!p) continue;
       const char* const end = p + segmentLens[seg];
       while (p < end) {
-        appendShapedRtlTokens(p, shaped);
+        appendShapedRtlTokens(p, extra);
         p += strlen(p) + 1;
       }
     }
-    int missed =
-        it->second->buildAdvanceTablePacked(segments, segmentLens, segmentCount, includeSpace, includeHyphen, styleMask,
-                                            shaped.empty() ? nullptr : shaped.c_str(), includeSmallCaps);
+    const char* extraPtr = extra.empty() ? nullptr : extra.c_str();
+    int missed = it->second->buildAdvanceTablePacked(segments, segmentLens, segmentCount, includeSpace, includeHyphen,
+                                                     styleMask, extraPtr, includeSmallCaps);
+    warmSdCardKernAndLigatures(*it->second, segments, segmentLens, segmentCount, extraPtr, styleMask, includeSmallCaps);
     if (missed > 0) {
       LOG_DBG("GFX", "ensureSdCardFontReady: %d glyph(s) not found", missed);
     }
@@ -470,7 +532,7 @@ static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMod
                              const EpdFontFamily& fontFamily, const uint32_t cp, int cursorX, int cursorY,
                              const bool pixelState, const EpdFontFamily::Style style, const int scaleNum,
                              const int scaleDen) {
-  if (renderer.grayPlanesAreAbsolute()) renderMode = GfxRenderer::BW;
+  (void)renderMode;
   EpdGlyph solidFallback;
   const EpdGlyph* glyph = fontFamily.getGlyphMetrics(cp, solidFallback, style);
   if (!glyph) return;
@@ -494,12 +556,14 @@ static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMod
   const int baseX = cursorX + glyph->left * scaleNum / scaleDen;
   const int baseY = cursorY - glyph->top * scaleNum / scaleDen;
   const bool halving = scaleNum * 2 == scaleDen;
+  const bool is4Bit = fontData->is4Bit;
   const bool is2Bit = fontData->is2Bit;
 
-  // Raw sample value: 1-bit fonts read 0 or 3, 2-bit fonts 0 (white) .. 3 (black).
+  // Normalized sample value: 0 (white) .. 15 (black).
   const auto sample = [&](const int pos) -> uint8_t {
-    if (is2Bit) return (bitmap[pos >> 2] >> ((3 - (pos & 3)) * 2)) & 0x3;
-    return ((bitmap[pos >> 3] >> (7 - (pos & 7))) & 1) ? 3 : 0;
+    if (is4Bit) return (bitmap[pos >> 1] >> (4 - (pos & 1) * 4)) & 0x0Fu;
+    if (is2Bit) return static_cast<uint8_t>(((bitmap[pos >> 2] >> ((3 - (pos & 3)) * 2)) & 0x03u) * 5u);
+    return ((bitmap[pos >> 3] >> (7 - (pos & 7))) & 1) ? 15u : 0u;
   };
 
   for (int dstY = 0; dstY < dstH; dstY++) {
@@ -519,8 +583,8 @@ static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMod
           samples++;
         }
       }
-      const bool ink = halving ? (is2Bit ? (maxRaw >= 2 || coverage >= 2) : maxRaw != 0)
-                               : samples > 0 && coverage * 2 >= samples * 3;
+      const bool ink = halving ? ((is2Bit || is4Bit) ? (maxRaw >= 10 || coverage >= 10) : maxRaw != 0)
+                               : samples > 0 && coverage * 2 >= samples * 15;
       if (ink) renderer.drawPixel(baseX + dstX, baseY + dstY, pixelState);
     }
   }
@@ -539,7 +603,7 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
   }
 
   const EpdFontData* fontData = fontFamily.getData(style);
-  const bool is2Bit = fontData->is2Bit;
+  const uint8_t bitsPerPixel = epdBitsPerPixel(*fontData);
   const uint8_t width = glyph->width;
   const uint8_t height = glyph->height;
   const int left = glyph->left;
@@ -582,7 +646,7 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
   } else {
     frame = {cursorX + left, cursorY - top, 1, 0, 0, 1};
   }
-  renderer.drawGlyphBitmap(bitmap, width, height, frame, is2Bit, renderMode, pixelState);
+  renderer.drawGlyphBitmap(bitmap, width, height, frame, bitsPerPixel, renderMode, pixelState);
 }
 
 // Draw an unscaled glyph placed by a logical frame. Equivalent to calling
@@ -590,7 +654,7 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
 // strip-band check and address math are resolved once per glyph rather than
 // once per pixel.
 void GfxRenderer::drawGlyphBitmap(const uint8_t* bitmap, const int width, const int height,
-                                  const glyphBitmap::Frame& frame, const bool twoBit, const RenderMode mode,
+                                  const glyphBitmap::Frame& frame, const uint8_t bitsPerPixel, const RenderMode mode,
                                   const bool state) const {
   // Apply the logical clip rectangle before rotating, in glyph-local pixels.
   glyphBitmap::Clip clip{0, 0, width, height};
@@ -612,10 +676,40 @@ void GfxRenderer::drawGlyphBitmap(const uint8_t* bitmap, const int width, const 
   physical.dyX = nextX - physical.x;
   physical.dyY = nextY - physical.y;
 
-  const glyphBitmap::Plane plane = mode == BW              ? glyphBitmap::Plane::BW
-                                   : mode == GRAYSCALE_MSB ? glyphBitmap::Plane::GrayMSB
-                                                           : glyphBitmap::Plane::GrayLSB;
-  glyphBitmap::draw(bitmap, width, height, twoBit, plane, state, target, clip);
+  glyphBitmap::Plane plane = glyphBitmap::Plane::BW;
+  switch (mode) {
+    case BW:
+      plane = gray16BaseActive_ ? glyphBitmap::Plane::Gray16BW : glyphBitmap::Plane::BW;
+      break;
+    case GRAYSCALE_LSB:
+      plane = glyphBitmap::Plane::GrayLSB;
+      break;
+    case GRAYSCALE_MSB:
+      plane = glyphBitmap::Plane::GrayMSB;
+      break;
+    case GRAY16_COARSE_LSB:
+      plane = glyphBitmap::Plane::Gray16CoarseLSB;
+      break;
+    case GRAY16_COARSE_MSB:
+      plane = glyphBitmap::Plane::Gray16CoarseMSB;
+      break;
+    case GRAY16_FINE_LSB:
+      plane = glyphBitmap::Plane::Gray16FineLSB;
+      break;
+    case GRAY16_FINE_MSB:
+      plane = glyphBitmap::Plane::Gray16FineMSB;
+      break;
+    case GRAY16_CLEANUP_DTM1:
+      plane = glyphBitmap::Plane::Gray16CleanupDTM1;
+      break;
+  }
+  glyphBitmap::draw(bitmap, width, height, bitsPerPixel, plane, state, target, clip);
+}
+
+void GfxRenderer::drawGlyphBitmap(const uint8_t* bitmap, const int width, const int height,
+                                  const glyphBitmap::Frame& frame, const bool twoBit, const RenderMode mode,
+                                  const bool state) const {
+  drawGlyphBitmap(bitmap, width, height, frame, static_cast<uint8_t>(twoBit ? 2 : 1), mode, state);
 }
 
 // IMPORTANT: This function is in critical rendering path and is called for every pixel. Please keep it as simple and
@@ -675,11 +769,14 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
   std::string visual;
   const char* renderedText = resolveVisualText(text, visual, baseDir);
 
-  // Redirected to the SD fallback: batch-load the string's glyphs so the
-  // per-codepoint measurement loop below doesn't fault them in one SD read
-  // at a time (#2725).
   if (resolvedFontId != fontId) {
     ensureSdGlyphsResident(resolvedFontId, renderedText, style, true);
+  } else if (const auto sdIt = sdCardFonts_.find(resolvedFontId); sdIt != sdCardFonts_.end() && sdIt->second) {
+    const uint8_t sdStyleIdx = resolveSdCardStyle(*sdIt->second, style);
+    if (sdIt->second->needsMetadataPrewarm(sdStyleIdx, renderedText)) {
+      const uint8_t styleMask = static_cast<uint8_t>(1u << (static_cast<uint8_t>(style) & 0x03));
+      sdIt->second->prewarm(renderedText, styleMask, /*metadataOnly=*/true, /*loadKernLig=*/true, /*accumulate=*/true);
+    }
   }
 
   int w = 0, h = 0;
@@ -721,7 +818,8 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
   int lastBaseLeft = 0;
   int lastBaseWidth = 0;
   int lastBaseTop = 0;
-  int32_t prevAdvanceFP = 0;  // 12.4 fixed-point: prev glyph's advance + next kern for snap
+  int32_t penFP = 0;          // 12.4 fixed-point cumulative pen offset from x
+  int32_t prevAdvanceFP = 0;  // 12.4 fixed-point advance of previous base glyph
 
   if (fontCacheManager_ && fontCacheManager_->isScanning()) {
     fontCacheManager_->recordText(renderedText, resolvedFontId, style);
@@ -730,8 +828,17 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
 
   // Redirected to the SD fallback: batch-load the string's glyphs so the draw
   // loop below doesn't fault them in one SD read at a time (#2725).
+  // For a primary SD font drawn outside a PrewarmScope (stubData active), prewarm
+  // with kerning and ligatures so direct drawText() calls match layout and PrewarmScope.
   if (resolvedFontId != fontId) {
     ensureSdGlyphsResident(resolvedFontId, renderedText, style, false);
+  } else if (const auto sdIt = sdCardFonts_.find(resolvedFontId); sdIt != sdCardFonts_.end() && sdIt->second) {
+    const uint8_t sdStyleIdx = resolveSdCardStyle(*sdIt->second, style);
+    if (sdIt->second->needsRenderPrewarm(sdStyleIdx, renderedText)) {
+      const uint8_t styleMask = static_cast<uint8_t>(1u << (static_cast<uint8_t>(style) & 0x03));
+      sdIt->second->prewarm(renderedText, styleMask, /*metadataOnly=*/false, /*loadKernLig=*/true,
+                            /*accumulate=*/true);
+    }
   }
 
   const auto fontIt = fontMap.find(resolvedFontId);
@@ -772,12 +879,12 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
       cp = font.applyLigatures(cp, textCursor, style);
     }
 
-    // Differential rounding: snap (previous advance + current kern) as one unit so
-    // identical character pairs always produce the same pixel step regardless of
-    // where they fall on the line.
+    // Cumulative fp4 pen tracking: accumulate fractional glyph advances and kerning
+    // in 1/16-px units across the word so fractional widths carry without drift.
     if (prevCp != 0) {
       const auto kernFP = font.getKerning(prevCp, cp, style);  // 4.4 fixed-point kern
-      lastBaseX += fp4::toPixel(prevAdvanceFP + kernFP) + trackingBetween(prevCp, cp, tracking);
+      penFP += prevAdvanceFP + kernFP + fp4::fromPixel(trackingBetween(prevCp, cp, tracking));
+      lastBaseX = x + fp4::toPixel(penFP);
     }
 
     EpdGlyph solidFallback;
@@ -1206,7 +1313,11 @@ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const 
       const uint8_t whiteMask = static_cast<uint8_t>(~blackMask);
 
       uint8_t* row = target + static_cast<int32_t>(py - originY) * panelStride;
-      switch (mode) {
+      const DitherMode effectiveMode = (renderMode == GRAY16_COARSE_LSB || renderMode == GRAY16_COARSE_MSB ||
+                                        renderMode == GRAY16_FINE_LSB || renderMode == GRAY16_FINE_MSB)
+                                           ? DitherMode::PreserveInk
+                                           : mode;
+      switch (effectiveMode) {
         case DitherMode::PreserveInk:
           for (int byte = byteStart; byte <= byteEnd; ++byte) {
             uint8_t mask = blackMask;
@@ -1529,6 +1640,21 @@ bool GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
       } else if (renderMode == GRAYSCALE_LSB || renderMode == GRAYSCALE_MSB) {
         const auto pixel = grayPlanePixel(val, renderMode == GRAYSCALE_MSB, absoluteGrayPlanes);
         if (pixel.write) drawPixel(screenX, screenY, pixel.black);
+      } else if (renderMode == GRAY16_COARSE_LSB &&
+                 freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskPass1Dtm1, val)) {
+        drawPixel(screenX, screenY, false);
+      } else if (renderMode == GRAY16_COARSE_MSB &&
+                 freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskPass1Dtm2, val)) {
+        drawPixel(screenX, screenY, false);
+      } else if (renderMode == GRAY16_FINE_LSB &&
+                 freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskPass2Dtm1, val)) {
+        drawPixel(screenX, screenY, false);
+      } else if (renderMode == GRAY16_FINE_MSB &&
+                 freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskPass2Dtm2, val)) {
+        drawPixel(screenX, screenY, false);
+      } else if (renderMode == GRAY16_CLEANUP_DTM1 &&
+                 freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskCleanupBlack, val)) {
+        drawPixel(screenX, screenY, true);
       }
     }
   }
@@ -1769,11 +1895,11 @@ HalDisplay::RefreshMode GfxRenderer::applyPromotedRefresh(const HalDisplay::Refr
   return promotedRefresh_;
 }
 
-void GfxRenderer::displayBuffer(HalDisplay::RefreshMode refreshMode) const {
+void GfxRenderer::displayBuffer(HalDisplay::RefreshMode refreshMode, const bool keepPowered) const {
   auto elapsed = millis() - start_ms;
   LOG_DBG("GFX", "Time = %lu ms from clearScreen to displayBuffer", elapsed);
   refreshMode = applyPromotedRefresh(refreshMode);
-  display.displayBuffer(refreshMode, fadingFix);
+  display.displayBuffer(refreshMode, !keepPowered && fadingFix);
 }
 
 void GfxRenderer::displayBufferAsync(HalDisplay::RefreshMode refreshMode) const {
@@ -2105,21 +2231,19 @@ int GfxRenderer::getSpaceWidth(const int fontId, const EpdFontFamily::Style styl
 
 int GfxRenderer::getSpaceAdvance(const int fontId, const uint32_t leftCp, const uint32_t rightCp,
                                  const EpdFontFamily::Style style) const {
-  // Advance table fast-path for SD card fonts during layout.
-  // Kern data is not loaded during layout (consistent with previous metadataOnly behavior),
-  // so we return just the space advance without kerning.
-  auto sdIt = sdCardFonts_.find(fontId);
-  if (sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
-    return fp4::toPixel(getSdCardSpaceAdvance(*sdIt->second, style));
-  }
-
   const auto fontIt = fontMap.find(fontId);
   if (fontIt == fontMap.end()) return 0;
   const auto& font = fontIt->second;
-  const EpdGlyph* spaceGlyph = font.getGlyph(' ', style);
-  const int32_t spaceAdvanceFP = spaceGlyph ? static_cast<int32_t>(spaceGlyph->advanceX) : 0;
+
+  int32_t spaceAdvanceFP = 0;
+  auto sdIt = sdCardFonts_.find(fontId);
+  if (sdIt != sdCardFonts_.end() && sdIt->second != nullptr && sdIt->second->hasAdvanceTable()) {
+    spaceAdvanceFP = getSdCardSpaceAdvance(*sdIt->second, style);
+  } else {
+    const EpdGlyph* spaceGlyph = font.getGlyph(' ', style);
+    spaceAdvanceFP = spaceGlyph ? static_cast<int32_t>(spaceGlyph->advanceX) : 0;
+  }
   // Combine space advance + flanking kern into one fixed-point sum before snapping.
-  // Snapping the combined value avoids the +/-1 px error from snapping each component separately.
   const int32_t kernFP = static_cast<int32_t>(font.getKerning(leftCp, ' ', style)) +
                          static_cast<int32_t>(font.getKerning(' ', rightCp, style));
   return fp4::toPixel(spaceAdvanceFP + kernFP);
@@ -2135,55 +2259,18 @@ int GfxRenderer::getKerning(const int fontId, const uint32_t leftCp, const uint3
 
 int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFamily::Style style, const int8_t tracking,
                                  const BidiUtils::BidiBaseDir baseDir, const TextMeasureMode mode) const {
+  if (text == nullptr || *text == '\0') {
+    return 0;
+  }
   // Match the font drawText would use for non-Latin strings (see resolveTextFontId).
   const int resolvedFontId = resolveTextFontId(fontId, text, style);
   // Measure the exact codepoint stream drawText renders: bidi-reordered and
   // Arabic-shaped (contextual presentation forms, Lam-Alef collapse).
-  // Measuring the raw logical text counts the Alef a ligature absorbs and
-  // uses base-letter advances instead of presentation-form advances, so RTL
-  // lines come out wider than they draw — uneven word gaps and a ragged
-  // right margin.
   std::string visual;
   text = resolveVisualText(text, visual, baseDir);
 
-  // Advance table fast-path for SD card fonts during layout.
-  // Snap each advance like drawText. Kerning/ligature data is not resident
-  // during layout, so kerned-pair steps can still differ.
-  auto sdIt = sdCardFonts_.find(resolvedFontId);
-  if (mode == TextMeasureMode::Layout && sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
-    int widthPx = 0;
-    int32_t prevAdvanceFP = 0;
-    uint32_t prevCp = 0;
-    const bool isSupSub = (style & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0;
-    const uint8_t styleIdx = resolveSdCardStyle(*sdIt->second, style);
-    const auto fontIt = fontMap.find(resolvedFontId);
-    if (fontIt == fontMap.end()) {
-      LOG_ERR("GFX", "Font %d not found", resolvedFontId);
-      return 0;
-    }
-    const auto& font = fontIt->second;
-    while (uint32_t cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text))) {
-      // RTL vowel marks (niqqud/harakat) and combining marks are zero-advance overlays in drawText.
-      if (BidiUtils::isTransparentMark(cp) || utf8IsCombiningMark(cp)) {
-        continue;
-      }
-      const uint32_t smallCapCp = (style & EpdFontFamily::SMALL_CAPS) ? utf8SmallCapsUpper(cp) : cp;
-      const bool isSmallCap = smallCapCp != cp;
-      cp = smallCapCp;
-      int32_t advFP = sdIt->second->getAdvance(cp, styleIdx);
-      if (advFP == 0 || (syntheticGlyph::isSolid(cp) && !font.hasCodepoint(cp, style))) {
-        EpdGlyph solidFallback;
-        const EpdGlyph* glyph = font.getGlyphMetrics(cp, solidFallback, style);
-        advFP = glyph ? glyph->advanceX : 0;
-      }
-      if (prevCp != 0) {
-        widthPx += fp4::toPixel(prevAdvanceFP) + trackingBetween(prevCp, cp, tracking);
-      }
-      prevAdvanceFP = isSupSub ? (advFP + 1) / 2 : (isSmallCap ? scaleSmallCapAdvance(advFP) : advFP);
-      prevCp = cp;
-    }
-    widthPx += fp4::toPixel(prevAdvanceFP);  // final glyph's advance
-    return widthPx;
+  if (resolvedFontId != fontId) {
+    ensureSdGlyphsResident(resolvedFontId, text, style, true);
   }
 
   const auto fontIt = fontMap.find(resolvedFontId);
@@ -2191,18 +2278,36 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
     LOG_ERR("GFX", "Font %d not found", resolvedFontId);
     return 0;
   }
+  const auto& font = fontIt->second;
+
+  SdCardFont* sdFont = nullptr;
+  uint8_t sdStyleIdx = 0;
+  const auto sdIt = sdCardFonts_.find(resolvedFontId);
+  if (sdIt != sdCardFonts_.end() && sdIt->second != nullptr) {
+    sdFont = sdIt->second;
+    sdStyleIdx = resolveSdCardStyle(*sdFont, style);
+    if (resolvedFontId == fontId) {
+      const EpdFont* epdFont = sdFont->getEpdFont(sdStyleIdx);
+      const bool hasStyleAdvance = sdFont->hasAdvanceTable(sdStyleIdx);
+      const bool missingMiniData = !epdFont || epdFont->data->intervals == nullptr;
+      if ((!hasStyleAdvance && missingMiniData) ||
+          (mode == TextMeasureMode::Layout && sdFont->needsKernLigPrewarm(sdStyleIdx, text)) ||
+          (missingMiniData && containsNonCjkKernCandidate(text))) {
+        ensureSdCardFontReady(resolvedFontId, text, static_cast<uint8_t>(1u << (static_cast<uint8_t>(style) & 0x03)));
+      }
+    }
+  }
+  const bool useSdAdvanceTable =
+      (mode == TextMeasureMode::Layout && sdFont != nullptr && sdFont->hasAdvanceTable(sdStyleIdx));
+  const bool isSupSub = (style & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0;
 
   uint32_t cp;
   uint32_t prevCp = 0;
-  int widthPx = 0;
-  int32_t prevAdvanceFP = 0;  // 12.4 fixed-point: prev glyph's advance + next kern for snap
-  const auto& font = fontIt->second;
+  int32_t penFP = 0;          // 12.4 fixed-point cumulative pen offset
+  int32_t prevAdvanceFP = 0;  // 12.4 fixed-point advance of previous base glyph
   while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text)))) {
-    // RTL vowel marks (niqqud/harakat) are zero-advance overlays in drawText — no width.
-    if (BidiUtils::isTransparentMark(cp)) {
-      continue;
-    }
-    if (utf8IsCombiningMark(cp)) {
+    // RTL vowel marks (niqqud/harakat) and combining marks are zero-advance overlays in drawText.
+    if (BidiUtils::isTransparentMark(cp) || utf8IsCombiningMark(cp)) {
       continue;
     }
     const uint32_t smallCapCp = (style & EpdFontFamily::SMALL_CAPS) ? utf8SmallCapsUpper(cp) : cp;
@@ -2213,25 +2318,32 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
       cp = font.applyLigatures(cp, text, style);
     }
 
-    // Differential rounding: snap (previous advance + current kern) together,
-    // matching drawText so measurement and rendering agree exactly.
+    // Cumulative fp4 pen tracking: matches drawText() glyph-for-glyph and returns
+    // fp4::toPixel(penFP + finalAdvanceFP) with zero layout-vs-render discrepancy.
     if (prevCp != 0) {
       const auto kernFP = font.getKerning(prevCp, cp, style);  // 4.4 fixed-point kern
-      widthPx += fp4::toPixel(prevAdvanceFP + kernFP) + trackingBetween(prevCp, cp, tracking);
+      penFP += prevAdvanceFP + kernFP + fp4::fromPixel(trackingBetween(prevCp, cp, tracking));
     }
 
-    EpdGlyph solidFallback;
-    const EpdGlyph* glyph = font.getGlyphMetrics(cp, solidFallback, style);
-    prevAdvanceFP = glyph ? glyph->advanceX : 0;
-    if ((style & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0) {
-      prevAdvanceFP = (prevAdvanceFP + 1) / 2;
-    } else if (isSmallCap) {
-      prevAdvanceFP = scaleSmallCapAdvance(prevAdvanceFP);
+    int32_t advFP = 0;
+    if (useSdAdvanceTable && !(syntheticGlyph::isSolid(cp) && !font.hasCodepoint(cp, style))) {
+      advFP = sdFont->getAdvance(cp, sdStyleIdx);
     }
+    if (advFP == 0) {
+      EpdGlyph solidFallback;
+      const EpdGlyph* glyph = font.getGlyphMetrics(cp, solidFallback, style);
+      advFP = glyph ? glyph->advanceX : 0;
+    }
+    if (isSupSub) {
+      advFP = (advFP + 1) / 2;
+    } else if (isSmallCap) {
+      advFP = scaleSmallCapAdvance(advFP);
+    }
+    prevAdvanceFP = advFP;
     prevCp = cp;
   }
-  widthPx += fp4::toPixel(prevAdvanceFP);  // final glyph's advance
-  return widthPx;
+  penFP += prevAdvanceFP;
+  return fp4::toPixel(penFP);
 }
 
 bool GfxRenderer::getCodepointMetrics(const int fontId, const uint32_t cp, const EpdFontFamily::Style style,
@@ -2254,6 +2366,15 @@ int GfxRenderer::drawScaledCodepoint(const int fontId, const uint32_t cp, const 
     fontCacheManager_->recordText(utf8, fontId, style);
     return 0;
   }
+  if (const auto sdIt = sdCardFonts_.find(fontId); sdIt != sdCardFonts_.end() && sdIt->second) {
+    char utf8[5] = {};
+    utf8AppendCodepoint(utf8, cp);
+    const uint8_t sdStyleIdx = resolveSdCardStyle(*sdIt->second, style);
+    if (sdIt->second->needsRenderPrewarm(sdStyleIdx, utf8)) {
+      const uint8_t styleMask = static_cast<uint8_t>(1u << (static_cast<uint8_t>(style) & 0x03));
+      sdIt->second->prewarm(utf8, styleMask, /*metadataOnly=*/false, /*loadKernLig=*/true, /*accumulate=*/true);
+    }
+  }
   const auto fontIt = fontMap.find(fontId);
   if (fontIt == fontMap.end()) return 0;
   const EpdFontFamily& font = fontIt->second;
@@ -2266,13 +2387,15 @@ int GfxRenderer::drawScaledCodepoint(const int fontId, const uint32_t cp, const 
 
   const int srcW = glyph->width;
   const int srcH = glyph->height;
+  const bool is4Bit = fontData->is4Bit;
   const bool is2Bit = fontData->is2Bit;
-  // Raw coverage: 1-bit fonts read 0 or 3, 2-bit fonts 0 (white) .. 3 (black); 0 outside the bitmap.
+  // Normalized coverage: 0 (white) .. 15 (black); 0 outside the bitmap.
   const auto sample = [&](const int sx, const int sy) -> int {
     if (sx < 0 || sy < 0 || sx >= srcW || sy >= srcH) return 0;
     const int pos = sy * srcW + sx;
-    if (is2Bit) return (bitmap[pos >> 2] >> ((3 - (pos & 3)) * 2)) & 0x3;
-    return ((bitmap[pos >> 3] >> (7 - (pos & 7))) & 1) ? 3 : 0;
+    if (is4Bit) return (bitmap[pos >> 1] >> (4 - (pos & 1) * 4)) & 0x0F;
+    if (is2Bit) return ((bitmap[pos >> 2] >> ((3 - (pos & 3)) * 2)) & 0x03) * 5;
+    return ((bitmap[pos >> 3] >> (7 - (pos & 7))) & 1) ? 15 : 0;
   };
 
   const int dstW = (srcW * scale256 + 255) / 256;
@@ -2292,8 +2415,8 @@ int GfxRenderer::drawScaledCodepoint(const int fontId, const uint32_t cp, const 
       const int fx = (sx >> 8) & 0xFF;
       const int upper = sample(x0, y0) * (256 - fx) + sample(x0 + 1, y0) * fx;
       const int lower = sample(x0, y0 + 1) * (256 - fx) + sample(x0 + 1, y0 + 1) * fx;
-      // Ink where interpolated coverage reaches half of full black (3).
-      if ((upper * (256 - fy) + lower * fy) * 2 >= 3 * 256 * 256) drawPixel(left + dx, top + dy, true);
+      // Ink where interpolated coverage reaches half of full black (15).
+      if ((upper * (256 - fy) + lower * fy) * 2 >= 15 * 256 * 256) drawPixel(left + dx, top + dy, true);
     }
   }
   return advance;
@@ -2346,10 +2469,14 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
 
   // Route non-Latin strings to the fallback font (see resolveTextFontId).
   const int resolvedFontId = resolveTextFontId(fontId, text, style);
-  // Redirected to the SD fallback: batch-load the string's glyphs so the draw
-  // loop below doesn't fault them in one SD read at a time (#2725).
   if (resolvedFontId != fontId) {
     ensureSdGlyphsResident(resolvedFontId, text, style, false);
+  } else if (const auto sdIt = sdCardFonts_.find(resolvedFontId); sdIt != sdCardFonts_.end() && sdIt->second) {
+    const uint8_t sdStyleIdx = resolveSdCardStyle(*sdIt->second, style);
+    if (sdIt->second->needsRenderPrewarm(sdStyleIdx, text)) {
+      const uint8_t styleMask = static_cast<uint8_t>(1u << (static_cast<uint8_t>(style) & 0x03));
+      sdIt->second->prewarm(text, styleMask, /*metadataOnly=*/false, /*loadKernLig=*/true, /*accumulate=*/true);
+    }
   }
   const auto fontIt = fontMap.find(resolvedFontId);
   if (fontIt == fontMap.end()) {
@@ -2363,7 +2490,8 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
   int lastBaseLeft = 0;
   int lastBaseWidth = 0;
   int lastBaseTop = 0;
-  int32_t prevAdvanceFP = 0;  // 12.4 fixed-point: prev glyph's advance + next kern for snap
+  int32_t penFP = 0;          // 12.4 fixed-point cumulative pen offset from y
+  int32_t prevAdvanceFP = 0;  // 12.4 fixed-point advance of previous base glyph
 
   uint32_t cp;
   uint32_t prevCp = 0;
@@ -2390,11 +2518,11 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
 
     cp = font.applyLigatures(cp, text, style);
 
-    // Differential rounding: snap (previous advance + current kern) as one unit,
-    // subtracting for the rotated coordinate direction.
+    // Cumulative fp4 pen tracking along the rotated axis (upward from y).
     if (prevCp != 0) {
       const auto kernFP = font.getKerning(prevCp, cp, style);  // 4.4 fixed-point kern
-      lastBaseY -= fp4::toPixel(prevAdvanceFP + kernFP);       // snap 12.4 fixed-point to nearest pixel
+      penFP += prevAdvanceFP + kernFP;
+      lastBaseY = y - fp4::toPixel(penFP);
     }
 
     EpdGlyph solidFallback;
@@ -2417,14 +2545,16 @@ size_t GfxRenderer::getBufferSize() const { return frameBufferSize; }
 // unused
 // void GfxRenderer::grayscaleRevert() const { display.grayscaleRevert(); }
 
-void GfxRenderer::displayGrayscaleBase(HalDisplay::RefreshMode fallback) const {
+void GfxRenderer::displayGrayscaleBase(HalDisplay::RefreshMode fallback, const bool keepPowered) const {
   absoluteGrayPlanes = false;
-  display.displayGrayscaleBase(applyPromotedRefresh(fallback), fadingFix);
+  display.displayGrayscaleBase(applyPromotedRefresh(fallback), !keepPowered && fadingFix);
 }
 
-bool GfxRenderer::displayGrayscaleBase(HalDisplay::GrayscaleMode mode, HalDisplay::RefreshMode fallback) const {
+bool GfxRenderer::displayGrayscaleBase(HalDisplay::GrayscaleMode mode, HalDisplay::RefreshMode fallback,
+                                       const bool keepPowered) const {
   absoluteGrayPlanes = false;
-  if (!display.displayGrayscaleBase(mode, promotedRefreshPending_ ? promotedRefresh_ : fallback, fadingFix))
+  if (!display.displayGrayscaleBase(mode, promotedRefreshPending_ ? promotedRefresh_ : fallback,
+                                    !keepPowered && fadingFix))
     return false;
   promotedRefreshPending_ = false;
   absoluteGrayPlanes = mode != HalDisplay::GrayscaleMode::Overlay;
@@ -2460,12 +2590,38 @@ void GfxRenderer::displayGrayBuffer() const {
   absoluteGrayPlanes = false;
 }
 
+bool GfxRenderer::supportsGray16() const { return display.supportsGray16(); }
+
+void GfxRenderer::displayGray16Pass1() const { display.displayGray16Pass1(); }
+
+void GfxRenderer::displayGray16Pass2() const { display.displayGray16Pass2(fadingFix); }
+
+void GfxRenderer::beginGray16Cleanup() const { display.beginGray16Cleanup(frameBuffer); }
+
+void GfxRenderer::finishGray16Cleanup() const { display.finishGray16Cleanup(); }
+
 void GfxRenderer::setRenderMode(RenderMode mode) {
   if (mode == BW && absoluteGrayPlanes) {
     display.cleanupGrayscaleBuffers(nullptr);  // cancel an unfinished absolute pass
     absoluteGrayPlanes = false;
   }
   renderMode = mode;
+}
+
+bool GfxRenderer::isFont4Bit(const int fontId, const EpdFontFamily::Style style) const {
+  const auto it = fontMap.find(fontId);
+  if (it == fontMap.end()) return false;
+  const EpdFontData* data = it->second.getData(style);
+  return data != nullptr && data->is4Bit;
+}
+
+bool GfxRenderer::has4BitFontForRender(const int fontId) const {
+  if (isFont4Bit(fontId)) return true;
+  for (const auto& [primaryId, fallbackId] : fallbackFontMap_) {
+    (void)primaryId;
+    if (isFont4Bit(fallbackId)) return true;
+  }
+  return false;
 }
 
 void GfxRenderer::writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* scratch, int yStart, int numRows) const {

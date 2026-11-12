@@ -249,7 +249,7 @@ Settings are grouped into **System**, **Display**, **Reader**, **Controls**, **L
   - "In Reader" - Show battery percentage everywhere except in reading mode
   - "Always" - Always hide battery percentage
 
-- **Refresh Frequency**: Set how often the screen does a full refresh while reading to reduce ghosting; options are every 1, 5, 10, 15, or 30 pages.
+- **Refresh Frequency**: Set how often the screen does a full refresh while reading to reduce ghosting; options are every 1, 5, 10, 15, or 30 pages. Two-pass 16-gray `.cpfont` text refreshes on Xteink X3 (UC8253 panel) run a cleanup refresh at least every 15 pages even if **Refresh Frequency** is set higher.
 
 - **UI Theme**: Set which UI theme to use:
   
@@ -280,7 +280,7 @@ Settings are grouped into **System**, **Display**, **Reader**, **Controls**, **L
 
 - **Embedded Style**: Whether to use the EPUB file's embedded HTML and CSS stylisation and formatting; options are "ON" or "OFF".
 
-- **Hyphenation**: Whether to hyphenate text in Reading Mode; options are "ON" or "OFF". Korean text wraps only at spaces when "OFF"; when "ON", a Korean word may also wrap at the end of a line between syllables or where it meets digits, Latin letters, or brackets (no hyphen is drawn).
+- **Hyphenation**: Whether to hyphenate text in Reading Mode; options are "ON" (default) or "OFF". Existing saved choices are preserved when upgrading. Korean text wraps only at spaces when "OFF"; when "ON", a Korean word may also wrap at the end of a line between syllables or where it meets digits, Latin letters, or brackets (no hyphen is drawn).
 
 - **Reading Orientation**: Set the screen orientation for reading EPUB files:
   

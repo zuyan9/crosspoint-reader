@@ -99,6 +99,8 @@ bool HalDisplay::toggleInverted() { return einkDisplay.toggleInverted(); }
 
 bool HalDisplay::isInverted() const { return einkDisplay.isInverted(); }
 
+void HalDisplay::powerOffBetweenFrames() { einkDisplay.powerOffBetweenFrames(); }
+
 void HalDisplay::deepSleep() { einkDisplay.deepSleep(); }
 
 uint8_t* HalDisplay::getFrameBuffer() const { return einkDisplay.getFrameBuffer(); }
@@ -144,6 +146,16 @@ void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) { einkDisplay
 void HalDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) { einkDisplay.cleanupGrayscaleBuffers(bwBuffer); }
 
 void HalDisplay::displayGrayBuffer(bool turnOffScreen) { einkDisplay.displayGrayBuffer(turnOffScreen); }
+
+bool HalDisplay::supportsGray16() const { return einkDisplay.supportsGray16(); }
+
+void HalDisplay::displayGray16Pass1() { einkDisplay.displayGray16Pass1(); }
+
+void HalDisplay::displayGray16Pass2(bool turnOffScreen) { einkDisplay.displayGray16Pass2(turnOffScreen); }
+
+void HalDisplay::beginGray16Cleanup(const uint8_t* bwBuffer) { einkDisplay.beginGray16Cleanup(bwBuffer); }
+
+void HalDisplay::finishGray16Cleanup() { einkDisplay.finishGray16Cleanup(); }
 
 void HalDisplay::writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* rows, uint16_t yStart, uint16_t numRows) {
   einkDisplay.writeGrayscalePlaneStrip(lsbPlane ? EInkDisplay::GRAY_PLANE_LSB : EInkDisplay::GRAY_PLANE_MSB, rows,
