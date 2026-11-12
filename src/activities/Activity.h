@@ -55,6 +55,19 @@ class Activity {
   virtual bool isHomeActivity() const { return false; }
   virtual bool handleHomeGesture() { return false; }
   virtual ScreenshotInfo getScreenshotInfo() const { return {}; }
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  virtual bool isPageBufferStale() const { return false; }
+  virtual void onDevReaderFontChanged() {}
+  virtual void onDevFrameBufferOverwritten() {}
+  virtual bool captureComposite2bpp(void* /*ctx*/, bool (* /*emitRow*/)(void* ctx, const uint8_t* row2bpp, size_t len),
+                                    StripCaptureMeta& /*meta*/) {
+    return false;
+  }
+  virtual bool captureComposite4bpp(void* /*ctx*/, bool (* /*emitRow*/)(void* ctx, const uint8_t* row4bpp, size_t len),
+                                    StripCaptureMeta& /*meta*/) {
+    return false;
+  }
+#endif
 
   // Start a new activity without destroying the current one
   // Note: requestUpdate() will be invoked automatically once resultHandler finishes

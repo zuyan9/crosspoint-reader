@@ -44,6 +44,9 @@
 #include "activities/ActivityManager.h"
 #include "activities/settings/SdFirmwareUpdateActivity.h"
 #include "components/UITheme.h"
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+#include "dev/UsbDevSerial.h"
+#endif
 #include "fontIds.h"
 #include "platform/UsbSerialJtagHandoff.h"
 #include "util/ButtonNavigator.h"
@@ -840,6 +843,9 @@ void loop() {
   static unsigned long lastMemPrint = 0;
 
   gpio.setSharedConfirmPowerShortPressEmitsPower(SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP);
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  UsbDevSerial::tickInput();
+#endif
   mappedInputManager.update();
 
   // Bluetooth page turner, before the USB drive's early return: a card handed to USB stops the radio
@@ -900,6 +906,9 @@ void loop() {
     lastMemPrint = millis();
   }
 
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+  const bool devCommandHandled = UsbDevSerial::pollCommands(renderer);
+#else
   // Handle incoming serial commands,
   // nb: we use logSerial from logging to avoid deprecation warnings
   if (logSerial.available() > 0) {
@@ -916,11 +925,16 @@ void loop() {
       }
     }
   }
+#endif
 
   // Check for any user activity (button press or release) or active background work
   static unsigned long lastActivityTime = millis();
   const bool userInput = gpio.wasAnyPressed() || gpio.wasAnyReleased() || gpio.wasTouchActivity() ||
-                         halTiltSensor.hadActivity() || remoteActed;
+                         halTiltSensor.hadActivity() ||
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+                         devCommandHandled ||
+#endif
+                         remoteActed;
   if (userInput) lastInputTime = millis();
   idleDisplayWhileAwake();
   if (userInput || activityManager.preventAutoSleep()) {
@@ -1059,6 +1073,9 @@ void loop() {
       return;
     }
     skipLoopDelay = activityManager.skipLoopDelay();
+#if defined(CROSSPOINT_USB_DEV) && CROSSPOINT_USB_DEV
+    if (UsbDevSerial::skipLoopDelay()) skipLoopDelay = true;
+#endif
   }
 
   // Add delay at the end of the loop to prevent tight spinning
