@@ -286,6 +286,8 @@ void EpubReaderActivity::stageIdleNextPage() {
   size_t stagedRleBytes = 0;
   Gray16ZeroRle::PlaneStripIndex stagedIndex{};
   uint32_t prewarmGen = 0;
+  const uint8_t effectiveTextContrast =
+      SETTINGS.screenInverted ? static_cast<uint8_t>(GfxRenderer::TextContrast::Crisp) : SETTINGS.textContrast;
 
   {
     auto scope = fcm->createPrewarmScope();
@@ -323,17 +325,21 @@ void EpubReaderActivity::stageIdleNextPage() {
           GfxRenderer::RenderMode prevMode;
           bool prevDither;
           bool prevGray16Base;
+          GfxRenderer::TextContrast prevContrast;
           ~IdleSpecRenderGuard() {
             renderer.endStripTarget();
             renderer.setRenderMode(prevMode);
             renderer.setDitherImagesInBw(prevDither);
             renderer.setGray16Base(prevGray16Base);
+            renderer.setTextContrast(prevContrast);
           }
-        } renderGuard{renderer, renderer.getRenderMode(), renderer.imagesDitheredInBw(), renderer.isGray16Base()};
+        } renderGuard{renderer, renderer.getRenderMode(), renderer.imagesDitheredInBw(), renderer.isGray16Base(),
+                      renderer.getTextContrast()};
 
         renderer.setRenderMode(GfxRenderer::BW);
         renderer.setDitherImagesInBw(SETTINGS.imageRendering == CrossPointSettings::IMAGES_DISPLAY_BW);
         renderer.setGray16Base(true);
+        renderer.setTextContrast(effectiveTextContrast);
 
         size_t rleCursor = 0;
         Gray16ZeroRleEncoder enc(tempRle.get(), MAX_SPEC_BASE_RLE_BYTES, rleCursor, stagedIndex);
@@ -390,6 +396,7 @@ void EpubReaderActivity::stageIdleNextPage() {
     specNextPage.panelHeight = static_cast<uint16_t>(renderer.getDisplayHeight());
     specNextPage.clippingCount = CLIPPINGS.clippingCount();
     specNextPage.orientation = SETTINGS.orientation;
+    specNextPage.textContrast = effectiveTextContrast;
     specNextPage.textAntiAliasing = SETTINGS.textAntiAliasing;
     specNextPage.imageRendering = SETTINGS.imageRendering;
     specNextPage.screenInverted = (SETTINGS.screenInverted != 0);
@@ -417,6 +424,8 @@ std::unique_ptr<Page> EpubReaderActivity::takeSpeculativeNextPage(const int spin
     return nullptr;
   }
 
+  const uint8_t effectiveTextContrast =
+      SETTINGS.screenInverted ? static_cast<uint8_t>(GfxRenderer::TextContrast::Crisp) : SETTINGS.textContrast;
   const bool match =
       specNextPage.spineIndex == spineIdx && specNextPage.pageIndex == pageIdx &&
       specNextPage.fontId == SETTINGS.getReaderFontId() &&
@@ -425,6 +434,7 @@ std::unique_ptr<Page> EpubReaderActivity::takeSpeculativeNextPage(const int spin
       specNextPage.panelWidthBytes == static_cast<uint16_t>(renderer.getDisplayWidthBytes()) &&
       specNextPage.panelHeight == static_cast<uint16_t>(renderer.getDisplayHeight()) &&
       specNextPage.clippingCount == CLIPPINGS.clippingCount() && specNextPage.orientation == SETTINGS.orientation &&
+      specNextPage.textContrast == effectiveTextContrast &&
       specNextPage.textAntiAliasing == SETTINGS.textAntiAliasing &&
       specNextPage.imageRendering == SETTINGS.imageRendering &&
       specNextPage.screenInverted == (SETTINGS.screenInverted != 0) && canStageSpeculativeGray16(*specNextPage.page);
@@ -2626,6 +2636,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     useGray16 = false;
     runGrayscalePass = false;
     combinedGrayscaleBase = false;
+    renderer.setTextContrast(GfxRenderer::TextContrast::Crisp);
     if (absoluteImageGrayscale) {
       absoluteImageGrayscale = false;
       renderer.setRenderMode(GfxRenderer::BW);
@@ -2654,9 +2665,16 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
                                               : SETTINGS.getRefreshFrequency();
   struct Gray16BaseGuard {
     GfxRenderer& renderer;
-    ~Gray16BaseGuard() { renderer.setGray16Base(false); }
+    ~Gray16BaseGuard() {
+      renderer.setGray16Base(false);
+      renderer.setTextContrast(GfxRenderer::TextContrast::Crisp);
+    }
   } gray16BaseGuard{renderer};
   renderer.setGray16Base(useGray16);
+  if (needsTextGrayscale && !SETTINGS.screenInverted && runGrayscalePass && grayscale.supported() &&
+      !absoluteImageGrayscale) {
+    renderer.setTextContrast(SETTINGS.textContrast);
+  }
   auto renderGrayscalePass = [&]() {
     // A4 gray planes replace the full page, including its clipping highlights.
     if (BoardConfig::isEegoA4()) drawClippingHighlights(*page, fontId, orientedMarginTop, orientedMarginLeft);
@@ -3364,6 +3382,13 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
 }
 
 void EpubReaderActivity::renderStatusBar() const {
+  const auto prevContrast = renderer.getTextContrast();
+  renderer.setTextContrast(GfxRenderer::TextContrast::Crisp);
+  struct StatusBarContrastGuard {
+    GfxRenderer& renderer;
+    GfxRenderer::TextContrast prev;
+    ~StatusBarContrastGuard() { renderer.setTextContrast(prev); }
+  } contrastGuard{renderer, prevContrast};
   if (activeStatusBarSnapshot) {
     const StatusBarSnapshot& s = *activeStatusBarSnapshot;
     if (!s.titleUsesMultiBitFont && renderer.isOverlayGrayPlane()) return;

@@ -141,6 +141,15 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     PARAGRAPH_ALIGNMENT_COUNT
   };
 
+  // Runtime reader text weight/contrast preset (persisted 0..3; default CRISP = 1).
+  enum TEXT_CONTRAST {
+    TEXT_CONTRAST_LIGHT = 0,
+    TEXT_CONTRAST_CRISP = 1,
+    TEXT_CONTRAST_MEDIUM = 2,
+    TEXT_CONTRAST_DARK = 3,
+    TEXT_CONTRAST_COUNT
+  };
+
   // Auto-sleep timeout options (in minutes)
   enum SLEEP_TIMEOUT {
     SLEEP_1_MIN = 0,
@@ -299,6 +308,7 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t characterSpacing = CHARACTER_SPACING_OFFSET;
   int8_t getCharacterSpacing() const { return static_cast<int8_t>(characterSpacing - CHARACTER_SPACING_OFFSET); }
   uint8_t textAntiAliasing = 1;
+  uint8_t textContrast = TEXT_CONTRAST_CRISP;
   // Short power button click behaviour
   uint8_t shortPwrBtn = IGNORE;
   // Power double click (see hasPowerDoubleClick()); Ignore disables the

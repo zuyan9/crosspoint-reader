@@ -45,6 +45,100 @@ constexpr uint16_t kBw4BitMask = freeink::gray16::kMask4BitBw;
 constexpr uint16_t kGrayLsb4BitMask = freeink::gray16::kMask4BitGrayLsb;
 constexpr uint16_t kGrayMsb4BitMask = freeink::gray16::kMask4BitGrayMsb;
 
+// Reader text weight/contrast presets for 4-bit glyphs (4-gray and 16-gray) and
+// 2-bit glyphs on 16-gray Split-Rail (default = Crisp, bit-identical to base masks).
+enum class TextContrast : uint8_t {
+  Light = 0,
+  Crisp = 1,
+  Medium = 2,
+  Dark = 3,
+};
+constexpr size_t kTextContrastCount = 4;
+
+struct Gray16MaskSet {
+#if CROSSPOINT_SUPPORT_GRAY16
+  uint16_t bwClear;
+  uint16_t pass1Dtm1;
+  uint16_t pass1Dtm2;
+  uint16_t pass2Dtm1;
+  uint16_t pass2Dtm2;
+#endif
+  uint16_t bw4Bit;
+  uint16_t grayLsb4Bit;
+  uint16_t grayMsb4Bit;
+#if CROSSPOINT_SUPPORT_GRAY16
+  uint16_t bwClear2Bit;
+  uint16_t pass1Dtm1_2Bit;
+  uint16_t pass1Dtm2_2Bit;
+  uint16_t pass2Dtm1_2Bit;
+  uint16_t pass2Dtm2_2Bit;
+#endif
+};
+#if CROSSPOINT_SUPPORT_GRAY16
+static_assert(sizeof(Gray16MaskSet) == 13 * sizeof(uint16_t), "Gray16MaskSet must stay 26 bytes");
+#else
+static_assert(sizeof(Gray16MaskSet) == 3 * sizeof(uint16_t), "4-gray Gray16MaskSet must stay 6 bytes");
+#endif
+
+// Compile-time permutation of a 16-bit ink plane mask through a monotonic 4-bit curve remap(0)=0 .. remap(15)=15.
+constexpr uint16_t permuteInkMask4Bit(uint16_t baseMask, const uint8_t (&inkMap)[16]) {
+  uint16_t out = 0;
+  for (uint8_t ink = 1; ink < 16; ++ink) {
+    const uint8_t mapped = inkMap[ink] & 0x0Fu;
+    if ((baseMask >> mapped) & 1u) out |= static_cast<uint16_t>(1u << ink);
+  }
+  return out;
+}
+
+constexpr Gray16MaskSet makeGray16MaskSet(const uint8_t (&inkMap)[16], [[maybe_unused]] uint8_t ink2Bit1 = 6,
+                                          [[maybe_unused]] uint8_t ink2Bit2 = 9) {
+  using namespace freeink::gray16;
+  return {
+#if CROSSPOINT_SUPPORT_GRAY16
+      permuteInkMask4Bit(kMaskBwClear, inkMap),
+      permuteInkMask4Bit(kMaskPass1Dtm1, inkMap),
+      permuteInkMask4Bit(kMaskPass1Dtm2, inkMap),
+      permuteInkMask4Bit(kMaskPass2Dtm1, inkMap),
+      permuteInkMask4Bit(kMaskPass2Dtm2, inkMap),
+#endif
+      permuteInkMask4Bit(kMask4BitBw, inkMap),
+      permuteInkMask4Bit(kMask4BitGrayLsb, inkMap),
+      permuteInkMask4Bit(kMask4BitGrayMsb, inkMap),
+#if CROSSPOINT_SUPPORT_GRAY16
+      permute2BitToGray16Mask(kMaskBwClear, ink2Bit1, ink2Bit2),
+      permute2BitToGray16Mask(kMaskPass1Dtm1, ink2Bit1, ink2Bit2),
+      permute2BitToGray16Mask(kMaskPass1Dtm2, ink2Bit1, ink2Bit2),
+      permute2BitToGray16Mask(kMaskPass2Dtm1, ink2Bit1, ink2Bit2),
+      permute2BitToGray16Mask(kMaskPass2Dtm2, ink2Bit1, ink2Bit2),
+#endif
+  };
+}
+
+inline constexpr uint8_t kInkMapLight[16] = {0, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15};
+inline constexpr uint8_t kInkMapCrisp[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+inline constexpr uint8_t kInkMapMedium[16] = {0, 2, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 14, 15, 15, 15};
+inline constexpr uint8_t kInkMapDark[16] = {0, 3, 5, 7, 8, 10, 11, 12, 13, 14, 14, 15, 15, 15, 15, 15};
+
+inline constexpr Gray16MaskSet kGray16ContrastPresets[kTextContrastCount] = {
+    makeGray16MaskSet(kInkMapLight, 3, 8),
+    makeGray16MaskSet(kInkMapCrisp, 6, 9),
+    makeGray16MaskSet(kInkMapMedium, 7, 11),
+    makeGray16MaskSet(kInkMapDark, 9, 14),
+};
+#if CROSSPOINT_SUPPORT_GRAY16
+static_assert(sizeof(kGray16ContrastPresets) == 104, "4 contrast presets must occupy 104 bytes of constexpr ROM");
+#else
+static_assert(sizeof(kGray16ContrastPresets) == 24, "4 4-gray contrast presets must occupy 24 bytes of constexpr ROM");
+#endif
+
+constexpr TextContrast sanitizeTextContrast(uint8_t raw) {
+  return raw < kTextContrastCount ? static_cast<TextContrast>(raw) : TextContrast::Crisp;
+}
+
+constexpr const Gray16MaskSet& gray16ContrastMasks(TextContrast contrast) {
+  return kGray16ContrastPresets[static_cast<uint8_t>(sanitizeTextContrast(static_cast<uint8_t>(contrast)))];
+}
+
 // Position of glyph pixel (0, 0) plus the step for one move along the glyph's
 // x and y axes, all in one coordinate space. The axes must describe an
 // orthogonal unit rotation: each is +/-1 on exactly one component.
@@ -288,8 +382,8 @@ __attribute__((noinline)) inline void drawRotatedPortrait4Bit(const uint8_t* bit
 //   alone, 1 means update); 1bpp glyphs paint ink with state on every plane.
 // Clipping happens before pixel decoding, so fully hidden glyphs cost nothing.
 inline void draw(const uint8_t* bitmap, int width, int height, uint8_t bitsPerPixel, Plane plane, bool state,
-                 const Target& target, Clip clip) {
-  using namespace freeink::gray16;
+                 const Target& target, Clip clip, TextContrast contrast = TextContrast::Crisp) {
+  const Gray16MaskSet& masks = gray16ContrastMasks(contrast);
   uint16_t setMask = 0;
   uint16_t clearMask = 0;
   const auto applyStatePolarity = [&](uint16_t levels) {
@@ -299,20 +393,22 @@ inline void draw(const uint8_t* bitmap, int width, int height, uint8_t bitsPerPi
       setMask = levels;
   };
 #if CROSSPOINT_SUPPORT_GRAY16
+  using freeink::gray16::kMaskCleanupBlack;
+  using freeink::gray16::mask2BitFrom4Bit;
   // Solid black stems (4bpp G00 with bwClear=1 and bleach masks=0, 2bpp ink=3, 1bpp ink=1) clear prior bleach bits.
   const uint16_t solidBlackBit =
       !state ? 0u
-             : (bitsPerPixel == 4 ? static_cast<uint16_t>(kMaskBwClear & ~(kMaskPass1Dtm1 | kMaskPass1Dtm2 |
-                                                                           kMaskPass2Dtm1 | kMaskPass2Dtm2))
+             : (bitsPerPixel == 4 ? static_cast<uint16_t>(masks.bwClear & ~(masks.pass1Dtm1 | masks.pass1Dtm2 |
+                                                                            masks.pass2Dtm1 | masks.pass2Dtm2))
                                   : static_cast<uint16_t>(1u << ((1u << bitsPerPixel) - 1u)));
 #endif
 
   switch (plane) {
     case Plane::BW:
-      applyStatePolarity(bitsPerPixel == 4 ? kMask4BitBw : (bitsPerPixel == 2 ? 0x000Eu : 0x0002u));
+      applyStatePolarity(bitsPerPixel == 4 ? masks.bw4Bit : (bitsPerPixel == 2 ? 0x000Eu : 0x0002u));
       break;
     case Plane::GrayLSB: {
-      const uint16_t levels = bitsPerPixel == 4 ? kMask4BitGrayLsb : (bitsPerPixel == 2 ? 0x0004u : 0x0002u);
+      const uint16_t levels = bitsPerPixel == 4 ? masks.grayLsb4Bit : (bitsPerPixel == 2 ? 0x0004u : 0x0002u);
       if (bitsPerPixel > 1)
         setMask = levels;
       else
@@ -320,7 +416,7 @@ inline void draw(const uint8_t* bitmap, int width, int height, uint8_t bitsPerPi
       break;
     }
     case Plane::GrayMSB: {
-      const uint16_t levels = bitsPerPixel == 4 ? kMask4BitGrayMsb : (bitsPerPixel == 2 ? 0x0006u : 0x0002u);
+      const uint16_t levels = bitsPerPixel == 4 ? masks.grayMsb4Bit : (bitsPerPixel == 2 ? 0x0006u : 0x0002u);
       if (bitsPerPixel > 1)
         setMask = levels;
       else
@@ -329,23 +425,22 @@ inline void draw(const uint8_t* bitmap, int width, int height, uint8_t bitsPerPi
     }
 #if CROSSPOINT_SUPPORT_GRAY16
     case Plane::Gray16BW:
-      applyStatePolarity(bitsPerPixel == 4 ? kMaskBwClear
-                                           : (bitsPerPixel == 2 ? mask2BitFrom4Bit(kMaskBwClear) : 0x0002u));
+      applyStatePolarity(bitsPerPixel == 4 ? masks.bwClear : (bitsPerPixel == 2 ? masks.bwClear2Bit : 0x0002u));
       break;
     case Plane::Gray16CoarseLSB:
-      setMask = bitsPerPixel == 4 ? kMaskPass1Dtm1 : (bitsPerPixel == 2 ? mask2BitFrom4Bit(kMaskPass1Dtm1) : 0u);
+      setMask = bitsPerPixel == 4 ? masks.pass1Dtm1 : (bitsPerPixel == 2 ? masks.pass1Dtm1_2Bit : 0u);
       clearMask = solidBlackBit;
       break;
     case Plane::Gray16CoarseMSB:
-      setMask = bitsPerPixel == 4 ? kMaskPass1Dtm2 : (bitsPerPixel == 2 ? mask2BitFrom4Bit(kMaskPass1Dtm2) : 0u);
+      setMask = bitsPerPixel == 4 ? masks.pass1Dtm2 : (bitsPerPixel == 2 ? masks.pass1Dtm2_2Bit : 0u);
       clearMask = solidBlackBit;
       break;
     case Plane::Gray16FineLSB:
-      setMask = bitsPerPixel == 4 ? kMaskPass2Dtm1 : (bitsPerPixel == 2 ? mask2BitFrom4Bit(kMaskPass2Dtm1) : 0u);
+      setMask = bitsPerPixel == 4 ? masks.pass2Dtm1 : (bitsPerPixel == 2 ? masks.pass2Dtm1_2Bit : 0u);
       clearMask = solidBlackBit;
       break;
     case Plane::Gray16FineMSB:
-      setMask = bitsPerPixel == 4 ? kMaskPass2Dtm2 : (bitsPerPixel == 2 ? mask2BitFrom4Bit(kMaskPass2Dtm2) : 0u);
+      setMask = bitsPerPixel == 4 ? masks.pass2Dtm2 : (bitsPerPixel == 2 ? masks.pass2Dtm2_2Bit : 0u);
       clearMask = solidBlackBit;
       break;
     case Plane::Gray16CleanupDTM1:

@@ -29,6 +29,14 @@ void forEachBaseSetting(SettingVisitor visit, void* context) {
     values[CrossPointSettings::STATUS_BAR_CLOCK_LEFT] = StrId::STR_DIR_LEFT;
     return values;
   }();
+  static constexpr auto TEXT_CONTRAST_VALUES = [] {
+    std::array<StrId, CrossPointSettings::TEXT_CONTRAST_COUNT> values{};
+    values[CrossPointSettings::TEXT_CONTRAST_LIGHT] = StrId::STR_CONTRAST_LIGHT;
+    values[CrossPointSettings::TEXT_CONTRAST_CRISP] = StrId::STR_CONTRAST_CRISP;
+    values[CrossPointSettings::TEXT_CONTRAST_MEDIUM] = StrId::STR_CONTRAST_MEDIUM;
+    values[CrossPointSettings::TEXT_CONTRAST_DARK] = StrId::STR_CONTRAST_DARK;
+    return values;
+  }();
 
   const auto emit = [visit, context](auto&& info) { visit(context, info); };
   // --- Display ---
@@ -122,6 +130,9 @@ void forEachBaseSetting(SettingVisitor visit, void* context) {
            .withTextSettings());
   emit(SettingInfo::Toggle(StrId::STR_TEXT_AA, &CrossPointSettings::textAntiAliasing, "textAntiAliasing",
                            StrId::STR_CAT_READER)
+           .withTextSettings());
+  emit(SettingInfo::StaticEnum(StrId::STR_TEXT_CONTRAST, &CrossPointSettings::textContrast, TEXT_CONTRAST_VALUES,
+                               "textContrast", StrId::STR_CAT_READER)
            .withTextSettings());
   emit(SettingInfo::Enum(StrId::STR_IMAGES, &CrossPointSettings::imageRendering,
                          {StrId::STR_IMAGES_DISPLAY, StrId::STR_IMAGES_PLACEHOLDER, StrId::STR_IMAGES_SUPPRESS,

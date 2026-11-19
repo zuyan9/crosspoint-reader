@@ -29,7 +29,20 @@ constexpr StrId LAYOUT_ROW_NAME_IDS[] = {
     StrId::STR_LINE_SPACING,          StrId::STR_WORD_SPACING, StrId::STR_CHARACTER_SPACING, StrId::STR_EXTRA_SPACING,
     StrId::STR_PARAGRAPH_INDENTATION, StrId::STR_ALIGNMENT,    StrId::STR_SCREEN_MARGIN};
 constexpr StrId STYLE_ROW_NAME_IDS[] = {StrId::STR_FOCUS_READING, StrId::STR_HYPHENATION_NO_PREVIEW,
-                                        StrId::STR_EMBEDDED_STYLE_NO_PREVIEW, StrId::STR_TEXT_AA_NO_PREVIEW};
+                                        StrId::STR_EMBEDDED_STYLE_NO_PREVIEW, StrId::STR_TEXT_AA_NO_PREVIEW,
+                                        StrId::STR_TEXT_CONTRAST_NO_PREVIEW};
+constexpr StrId TEXT_CONTRAST_IDS[] = {StrId::STR_CONTRAST_LIGHT, StrId::STR_CONTRAST_CRISP, StrId::STR_CONTRAST_MEDIUM,
+                                       StrId::STR_CONTRAST_DARK};
+static_assert(std::size(TEXT_CONTRAST_IDS) == CrossPointSettings::TEXT_CONTRAST_COUNT);
+static_assert(static_cast<size_t>(CrossPointSettings::TEXT_CONTRAST_COUNT) == glyphBitmap::kTextContrastCount);
+static_assert(static_cast<uint8_t>(CrossPointSettings::TEXT_CONTRAST_LIGHT) ==
+              static_cast<uint8_t>(GfxRenderer::TextContrast::Light));
+static_assert(static_cast<uint8_t>(CrossPointSettings::TEXT_CONTRAST_CRISP) ==
+              static_cast<uint8_t>(GfxRenderer::TextContrast::Crisp));
+static_assert(static_cast<uint8_t>(CrossPointSettings::TEXT_CONTRAST_MEDIUM) ==
+              static_cast<uint8_t>(GfxRenderer::TextContrast::Medium));
+static_assert(static_cast<uint8_t>(CrossPointSettings::TEXT_CONTRAST_DARK) ==
+              static_cast<uint8_t>(GfxRenderer::TextContrast::Dark));
 
 int findCurrentFontIndex(const SdCardFontRegistry* registry, const char* sdFontFamilyName, uint8_t fontFamily) {
   if (sdFontFamilyName[0] != '\0' && registry) {
@@ -230,11 +243,14 @@ void TextSettingsActivity::buildScreen(UiScreen& screen) {
       case Tab::Layout:
         rowValues_[i] = layoutValueText(i);
         break;
+      case Tab::Style:
+        rowValues_[i] = styleValueText(i);
+        break;
       default:
         break;
     }
     rowItems_[i].value = rowValues_[i].empty() ? nullptr : rowValues_[i].c_str();
-    if (tab_ == Tab::Style) {
+    if (tab_ == Tab::Style && i != static_cast<int>(StyleRow::TextContrast)) {
       GUI.setCheckboxRow(rowItems_[i], styleRowChecked(i));
     } else if (tab_ == Tab::Layout && i == static_cast<int>(LayoutRow::ParaSpacing)) {
       GUI.setCheckboxRow(rowItems_[i], SETTINGS.extraParagraphSpacing);
@@ -265,7 +281,7 @@ const char* TextSettingsActivity::confirmLabelText() const {
     case Tab::Layout:
       return ringPos() - 1 == static_cast<int>(LayoutRow::ParaSpacing) ? tr(STR_TOGGLE) : tr(STR_SELECT);
     case Tab::Style:
-      return tr(STR_TOGGLE);
+      return ringPos() - 1 == static_cast<int>(StyleRow::TextContrast) ? tr(STR_SELECT) : tr(STR_TOGGLE);
     default:
       return tr(STR_SELECT);
   }
@@ -497,12 +513,32 @@ void TextSettingsActivity::confirmStyleRow(int row) {
     case StyleRow::AntiAliasing:
       SETTINGS.textAntiAliasing = !SETTINGS.textAntiAliasing;
       break;
+    case StyleRow::TextContrast: {
+      const int cur = SETTINGS.textContrast < CrossPointSettings::TEXT_CONTRAST_COUNT
+                          ? SETTINGS.textContrast
+                          : CrossPointSettings::TEXT_CONTRAST_CRISP;
+      optionPopup_.show(StrId::STR_TEXT_CONTRAST, TEXT_CONTRAST_IDS, static_cast<int>(std::size(TEXT_CONTRAST_IDS)),
+                        cur, [](int idx) {
+                          SETTINGS.textContrast = static_cast<uint8_t>(idx);
+                          SETTINGS.saveToFile();
+                        });
+      requestUpdate();
+      return;
+    }
 
     default:
       return;
   }
   SETTINGS.saveToFile();
   requestUpdate();
+}
+
+std::string TextSettingsActivity::styleValueText(int row) const {
+  if (static_cast<StyleRow>(row) == StyleRow::TextContrast) {
+    const uint8_t v = SETTINGS.textContrast;
+    return I18N.get(TEXT_CONTRAST_IDS[v < std::size(TEXT_CONTRAST_IDS) ? v : CrossPointSettings::TEXT_CONTRAST_CRISP]);
+  }
+  return "";
 }
 
 bool TextSettingsActivity::styleRowChecked(int row) const {

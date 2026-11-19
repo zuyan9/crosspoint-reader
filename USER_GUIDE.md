@@ -300,6 +300,8 @@ Settings are grouped into **System**, **Display**, **Reader**, **Controls**, **L
 
 - **Text Anti-Aliasing**: Whether to show smooth grey edges (anti-aliasing) on text in reading mode. Note this slows down page turns slightly.
 
+- **Text Contrast**: Adjust the stroke weight of reading fonts when **Text Anti-Aliasing** is on and **Night Mode** is off; options are "Light", "Crisp" (default), "Medium", or "Dark". It applies to 4-bit reading fonts (direct TTF/OTF/TTC fonts and 4-bit `.cpfont` files) on all grayscale panels, and also adjusts built-in **Noto Sans** and 2-bit `.cpfont` reader fonts on 16-gray panels (Xteink X3, UC8253 panel). Changing this setting does not re-paginate the book, and has no effect on 2-bit fonts on 4-gray panels, UI text, monochrome rendering, or **Night Mode**.
+
 - **Images**: How embedded images (JPG/PNG/GIF) in EPUB files are shown. GIFs render only the first frame; interlaced GIFs are not supported.
   - **Display** (default): images in gray levels. Pages with images take an extra grayscale refresh.
   - **Placeholder**: the image's alt text in place of the image.

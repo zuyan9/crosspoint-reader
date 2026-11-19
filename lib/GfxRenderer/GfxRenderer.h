@@ -23,10 +23,7 @@ class TtfEpdFont;
 
 #include "Bitmap.h"
 #include "FontVariantProvider.h"
-
-namespace glyphBitmap {
-struct Frame;
-}
+#include "GlyphBitmap.h"
 
 // Color representation: uint8_t mapped to 4x4 Bayer matrix dithering levels
 // 0 = transparent, 1-16 = gray levels (white to black)
@@ -45,6 +42,7 @@ class GfxRenderer {
     GRAY16_CLEANUP_DTM1
   };
   enum class DitherMode { Replace, PreserveInk };
+  using TextContrast = glyphBitmap::TextContrast;
 
   // Logical screen orientation from the perspective of callers
   enum Orientation {
@@ -65,6 +63,7 @@ class GfxRenderer {
   mutable bool gray16CleanOnGlass_ = false;
   mutable bool gray16BaselineDirty_ = false;
 #endif
+  mutable TextContrast textContrast_ = TextContrast::Crisp;
   bool ditherImagesInBw = false;
   Orientation orientation;
   bool fadingFix;
@@ -462,6 +461,11 @@ class GfxRenderer {
   void setGray16Base(bool) const {}
   bool isGray16Base() const { return false; }
 #endif
+  void setTextContrast(TextContrast contrast) const {
+    textContrast_ = glyphBitmap::sanitizeTextContrast(static_cast<uint8_t>(contrast));
+  }
+  void setTextContrast(uint8_t grade) const { textContrast_ = glyphBitmap::sanitizeTextContrast(grade); }
+  TextContrast getTextContrast() const { return textContrast_; }
   // Settle the full frame after displaying the B/W base and before writing
   // the grayscale planes (no-op on X4).
   void preconditionGrayscale() const;

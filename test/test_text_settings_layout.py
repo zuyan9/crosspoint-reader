@@ -28,6 +28,12 @@ style_labels = re.sub(
     lambda match: english.split(match[1] + ": ", 1)[1].splitlines()[0],
     style_labels,
 )
+contrast_labels = activity.split("constexpr StrId TEXT_CONTRAST_IDS[] = {", 1)[1].split("};", 1)[0]
+contrast_labels = re.sub(
+    r"StrId::(STR_[A-Z_]+)",
+    lambda match: english.split(match[1] + ": ", 1)[1].splitlines()[0],
+    contrast_labels,
+)
 enter = activity.split("  metrics_ =", 1)[1].split("\n  fonts_.clear();", 1)[0]
 build = activity.split("void TextSettingsActivity::buildScreen(UiScreen& screen) {", 1)[1]
 rows = "  fui::ListProps props;" + build.split("  fui::ListProps props;", 1)[1]
@@ -302,10 +308,14 @@ void checkStyleRowsFit(const BoardConfig::BoardProfile& profile, GfxRenderer::Or
   activity.renderer.orientation = orientation;
   activity.enterGeometry();
   const char* labels[] = {""" + style_labels + r"""};
-  for (const char* label : labels) {
+  const char* contrastValues[] = {""" + contrast_labels + r"""};
+  static_assert(std::size(labels) == 5, "Style tab has 4 toggles + Text Contrast picker");
+  static_assert(std::size(contrastValues) == 4, "Text Contrast has 4 presets");
+  constexpr int kContrastRow = 4;
+  for (int i = 0; i < static_cast<int>(std::size(labels)); ++i) {
     fui::ListItem row;
-    row.label = label;
-    row.toggle = true;
+    row.label = labels[i];
+    row.toggle = (i != kContrastRow);
     activity.rowItems_.push_back(row);
   }
 
@@ -315,38 +325,78 @@ void checkStyleRowsFit(const BoardConfig::BoardProfile& profile, GfxRenderer::Or
   device.height = activity.renderer.getScreenHeight();
   int top, right, bottom, left;
   activity.renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
+  const Rect safe = UITheme::getInstance().getScreenSafeArea(activity.renderer, true, false);
   device.safeArea = fui::Insets{static_cast<int16_t>(top), static_cast<int16_t>(right),
                                 static_cast<int16_t>(bottom), static_cast<int16_t>(left)};
   fui::InputSnapshot input;
   fui::InteractionBuffer<32> interactions;
   fui::Frame<32> frame(target, device, input, interactions);
   auto theme = uiThemeTokens(target);
-  for (bool checked : {false, true}) {
-    for (auto& row : activity.rowItems_) row.toggleChecked = checked;
-    for (int focus : {0, 1, 2, 3, 4}) {
-      activity.selected = focus;
-      activity.nav.reset(focus);
-      interactions.clear();
-      UiScreen screen(frame, theme);
-      activity.buildScreen(screen);
-      target.textRects.clear();
-      target.textStrings.clear();
-      target.clippedText = false;
-      activity.buildRows(screen);
-      if (activity.nav.drawnRows != 4) {
-        std::fprintf(stderr, "%s orientation %d: list height %d, full rows %d\n",
-                     profile.name, static_cast<int>(orientation), screen.contentRect().height, activity.nav.drawnRows);
-      }
-      assert(activity.nav.top == 0);
-      assert(activity.nav.drawnRows == 4);
-      assert(target.textRects.size() == 4);
-      assert(!target.clippedText);
-      assert(target.textStrings[0].find("(no preview)") == std::string::npos);
-      for (int row = 0; row < 4; ++row) {
-        assert(target.textStrings[row] == labels[row]);
-        assert(target.measureText(theme.smallText.font, labels[row], theme.smallText).width <=
-               target.textRects[row].width);
-        if (row != 0) assert(target.textStrings[row].find("(no preview)") != std::string::npos);
+  const bool portrait =
+      orientation == GfxRenderer::Portrait || orientation == GfxRenderer::PortraitInverted;
+  for (const char* contrastValue : contrastValues) {
+    activity.rowItems_[kContrastRow].value = contrastValue;
+    for (bool checked : {false, true}) {
+      for (int i = 0; i < kContrastRow; ++i) activity.rowItems_[i].toggleChecked = checked;
+      for (int focus : {0, 1, 2, 3, 4, 5}) {
+        activity.selected = focus;
+        activity.nav.reset(focus);
+        interactions.clear();
+        UiScreen screen(frame, theme);
+        activity.buildScreen(screen);
+        const auto content = screen.contentRect();
+        target.textRects.clear();
+        target.textStrings.clear();
+        target.clippedText = false;
+        activity.buildRows(screen);
+        const bool fitsAllFive = portrait || content.height >= 225;
+        const int expectedDrawn = fitsAllFive ? 5 : 4;
+        const int expectedTop = (!fitsAllFive && focus == 5) ? 1 : 0;
+        if (activity.nav.drawnRows != expectedDrawn || activity.nav.top != expectedTop) {
+          std::fprintf(stderr, "%s orientation %d: list height %d, full rows %d, top %d\n",
+                       profile.name, static_cast<int>(orientation), content.height,
+                       activity.nav.drawnRows, activity.nav.top);
+        }
+        assert(activity.nav.top == expectedTop);
+        assert(activity.nav.drawnRows == expectedDrawn);
+        if (fitsAllFive) {
+          assert(!target.clippedText);
+          assert(target.textStrings.size() == 6);
+        } else if (focus == 5) {
+          assert(!target.clippedText);
+          assert(target.textStrings.size() == 5);
+        }
+        for (const auto& rect : target.textRects) {
+          assert(rect.x >= safe.x && rect.right() <= safe.x + safe.width);
+          assert(rect.y >= content.y && rect.bottom() <= content.bottom());
+        }
+        size_t ti = 0;
+        for (int row = activity.nav.top; row < activity.nav.top + activity.nav.drawnRows; ++row) {
+          if (row == kContrastRow) {
+            assert(ti + 1 < target.textStrings.size());
+            assert(target.textStrings[ti] == contrastValue);
+            const fui::Rect valueRect = target.textRects[ti++];
+            assert(target.textStrings[ti] == labels[row]);
+            const fui::Rect labelRect = target.textRects[ti++];
+            assert(target.measureText(theme.smallText.font, contrastValue, theme.smallText).width <=
+                   valueRect.width);
+            assert(target.measureText(theme.smallText.font, labels[row], theme.smallText).width <=
+                   labelRect.width);
+            assert(std::string(labels[row]).find("(no preview)") != std::string::npos);
+            assert(labelRect.right() <= valueRect.x);
+          } else {
+            assert(ti < target.textStrings.size());
+            assert(target.textStrings[ti] == labels[row]);
+            assert(target.measureText(theme.smallText.font, labels[row], theme.smallText).width <=
+                   target.textRects[ti].width);
+            if (row == 0) {
+              assert(target.textStrings[ti].find("(no preview)") == std::string::npos);
+            } else {
+              assert(target.textStrings[ti].find("(no preview)") != std::string::npos);
+            }
+            ++ti;
+          }
+        }
       }
     }
   }

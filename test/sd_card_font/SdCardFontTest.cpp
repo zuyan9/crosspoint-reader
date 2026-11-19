@@ -2180,3 +2180,134 @@ TEST(SdCardFontTest, FourBitAndTwoBitCpfontsRenderSplitRailGray16StripsAndCleanu
     EXPECT_EQ(v >= 1 ? 0u : 1u, readBit(clean2.data(), lx, 24, kStripY0)) << "cleanup v=" << v;
   }
 }
+
+TEST(SdCardFontTest, TwoBitBuiltInAndSdFontsRenderSplitRailGray16WithTextContrastPresets) {
+  constexpr int kWidth = 792;
+  constexpr int kWidthBytes = kWidth / 8;
+  constexpr int kHeight = 528;
+  constexpr int kStripY0 = 480;
+  constexpr int kStripRows = 48;
+
+  // 1. In-Flash 2-bit EpdFontData (models built-in Noto Sans 12/14/16/18 pt: bitmapHandler == nullptr,
+  //    is2Bit = true, is4Bit = false; 'N' is 4x2 with 2bpp row [0, 1, 2, 3] = 0x1B).
+  static constexpr uint8_t kBuiltIn2BitBmp[2] = {0x1Bu, 0x1Bu};
+  static constexpr EpdGlyph kBuiltIn2BitGlyphs[1] = {{4, 2, 4 << 4, 0, 2, 2, 0}};
+  static constexpr EpdUnicodeInterval kBuiltIn2BitIntervals[1] = {{'N', 'N', 0}};
+  EpdFontData builtInData{};
+  builtInData.bitmap = kBuiltIn2BitBmp;
+  builtInData.glyph = kBuiltIn2BitGlyphs;
+  builtInData.intervals = kBuiltIn2BitIntervals;
+  builtInData.intervalCount = 1;
+  builtInData.advanceY = 20;
+  builtInData.ascender = 16;
+  builtInData.descender = -4;
+  builtInData.is2Bit = true;
+  builtInData.is4Bit = false;
+  const EpdFont builtInFont(&builtInData);
+  ASSERT_FALSE(builtInFont.data->is4Bit);
+  ASSERT_TRUE(builtInFont.data->is2Bit);
+  ASSERT_EQ(nullptr, builtInFont.data->bitmapHandler);
+  ASSERT_EQ(2u, epdBitsPerPixel(*builtInFont.data));
+
+  // 2. 2-bit SD .cpfont (flags = CPFONT_FLAG_2BIT = 0x0001u, is2Bit = true, is4Bit = false) with identical 'N' glyph:
+  constexpr size_t hdrSize = 32;
+  constexpr size_t tocSize = 32;
+  constexpr size_t ivSize = 2 * sizeof(EpdUnicodeInterval);
+  constexpr size_t glSize = 2 * sizeof(EpdGlyph);
+  constexpr uint16_t bmpBytes = 2;
+  const size_t dataOff = hdrSize + tocSize;
+  sdFontTestFile.assign(hdrSize + tocSize + ivSize + glSize + bmpBytes * 2, 0);
+  std::memcpy(sdFontTestFile.data(), "CPFONT\0\0", 8);
+  put16(8, 4);
+  put16(10, SdCardFont::CPFONT_FLAG_2BIT);
+  sdFontTestFile[12] = 1;
+  put32(hdrSize + 4, 2);
+  put32(hdrSize + 8, 2);
+  sdFontTestFile[hdrSize + 12] = 20;
+  put16(hdrSize + 13, 16);
+  put16(hdrSize + 15, static_cast<uint16_t>(-4));
+  put32(hdrSize + 24, static_cast<uint32_t>(dataOff));
+  const EpdUnicodeInterval sdIvs[2] = {{'N', 'N', 0}, {0xFFFD, 0xFFFD, 1}};
+  std::memcpy(sdFontTestFile.data() + dataOff, sdIvs, ivSize);
+  const EpdGlyph sdGls[2] = {{4, 2, 4 << 4, 0, 2, bmpBytes, 0}, {4, 2, 4 << 4, 0, 2, bmpBytes, bmpBytes}};
+  std::memcpy(sdFontTestFile.data() + dataOff + ivSize, sdGls, glSize);
+  std::fill_n(sdFontTestFile.data() + dataOff + ivSize + glSize, bmpBytes * 2, 0x1Bu);
+
+  SdCardFont sdFont2;
+  ASSERT_TRUE(sdFont2.load("Serif2b_14.cpfont"));
+  ASSERT_EQ(0, sdFont2.prewarm("N", 0x01));
+  const EpdFont* sdEpd2 = sdFont2.getEpdFont(0);
+  ASSERT_NE(nullptr, sdEpd2);
+  EXPECT_TRUE(sdEpd2->data->is2Bit);
+  EXPECT_FALSE(sdEpd2->data->is4Bit);
+  ASSERT_EQ(2u, epdBitsPerPixel(*sdEpd2->data));
+
+  const auto resolveBmp = [](const EpdFont& f, const EpdGlyph* g) -> const uint8_t* {
+    if (f.data->bitmapHandler) return f.data->bitmapHandler(f.data->glyphMissCtx, g);
+    return f.data->bitmap ? f.data->bitmap + g->dataOffset : nullptr;
+  };
+  const auto readBit = [&](const uint8_t* plane, int lx, int ly, int yOrigin) -> uint8_t {
+    const int phyX = ly;
+    const int phyY = kHeight - 1 - lx;
+    const size_t idx = static_cast<size_t>(phyY - yOrigin) * kWidthBytes + static_cast<size_t>(phyX / 8);
+    return (plane[idx] >> (7 - (phyX % 8))) & 1u;
+  };
+
+  struct ContrastCase {
+    glyphBitmap::TextContrast preset;
+    std::array<uint8_t, 4> expectedGray;
+  };
+  constexpr std::array<ContrastCase, 4> kCases = {{
+      {glyphBitmap::TextContrast::Light, {15, 12, 7, 0}},
+      {glyphBitmap::TextContrast::Crisp, {15, 9, 6, 0}},
+      {glyphBitmap::TextContrast::Medium, {15, 8, 4, 0}},
+      {glyphBitmap::TextContrast::Dark, {15, 6, 1, 0}},
+  }};
+
+  // Portrait X3 physical placement for logical (lx = 20, ly = 24): phyX = ly, phyY = 527 - lx, dxX=0, dxY=-1, dyX=1,
+  // dyY=0.
+  const glyphBitmap::Frame physFrame{24, kHeight - 1 - 20, 0, -1, 1, 0};
+  const glyphBitmap::Clip clip{0, 0, 4, 2};
+  std::vector<uint8_t> bwPlane(static_cast<size_t>(kWidthBytes) * kHeight, 0xFFu);
+
+  for (const EpdFont* fontPtr : {&builtInFont, sdEpd2}) {
+    const EpdGlyph* g = fontPtr->getGlyph('N');
+    ASSERT_NE(nullptr, g);
+    const uint8_t* bmp = resolveBmp(*fontPtr, g);
+    ASSERT_NE(nullptr, bmp);
+    const uint8_t bpp = epdBitsPerPixel(*fontPtr->data);
+
+    for (const auto& tc : kCases) {
+      std::fill(bwPlane.begin(), bwPlane.end(), 0xFFu);
+      glyphBitmap::draw(bmp, g->width, g->height, bpp, glyphBitmap::Plane::Gray16BW, true,
+                        {bwPlane.data(), kWidth, kWidthBytes, 0, kHeight, physFrame}, clip, tc.preset);
+
+      auto renderStrip = [&](glyphBitmap::Plane plane, uint8_t initVal) {
+        std::vector<uint8_t> strip(static_cast<size_t>(kWidthBytes) * kStripRows, initVal);
+        glyphBitmap::draw(bmp, g->width, g->height, bpp, plane, true,
+                          {strip.data(), kWidth, kWidthBytes, kStripY0, kStripRows, physFrame}, clip, tc.preset);
+        return strip;
+      };
+      const auto cLsb = renderStrip(glyphBitmap::Plane::Gray16CoarseLSB, 0x00u);
+      const auto cMsb = renderStrip(glyphBitmap::Plane::Gray16CoarseMSB, 0x00u);
+      const auto fLsb = renderStrip(glyphBitmap::Plane::Gray16FineLSB, 0x00u);
+      const auto fMsb = renderStrip(glyphBitmap::Plane::Gray16FineMSB, 0x00u);
+      const auto cleanDtm1 = renderStrip(glyphBitmap::Plane::Gray16CleanupDTM1, 0xFFu);
+
+      for (int v = 0; v < 4; ++v) {
+        const int lx = 20 + v;
+        const int ly = 24;
+        const uint8_t bw = readBit(bwPlane.data(), lx, ly, 0);
+        const uint8_t cl = readBit(cLsb.data(), lx, ly, kStripY0);
+        const uint8_t cm = readBit(cMsb.data(), lx, ly, kStripY0);
+        const uint8_t fl = readBit(fLsb.data(), lx, ly, kStripY0);
+        const uint8_t fm = readBit(fMsb.data(), lx, ly, kStripY0);
+        const uint8_t cln = readBit(cleanDtm1.data(), lx, ly, kStripY0);
+        const uint8_t code5 = static_cast<uint8_t>((bw << 4) | (cl << 3) | (cm << 2) | (fl << 1) | fm);
+        EXPECT_EQ(tc.expectedGray[v], freeink::gray16::kDecodeGray16[code5])
+            << "builtIn=" << (fontPtr == &builtInFont) << " preset=" << static_cast<int>(tc.preset) << " v=" << v;
+        EXPECT_EQ(v >= 1 ? 0u : 1u, cln) << "cleanup v=" << v;
+      }
+    }
+  }
+}

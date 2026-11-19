@@ -364,8 +364,464 @@ TEST(GlyphBitmap, OverlappingSolidBlackGlyphClearsPriorGray16BleachBits) {
   }
 }
 
-TEST(GlyphBitmap, Portrait4BitFastPathBitExactAgainstScalarPaintAcrossPlanesOffsetsWidthsAndClips) {
-  using namespace freeink::gray16;
+TEST(GlyphBitmap, ContrastPresetsPreserveSplitRailCalibrationAndMonotonicStemWeight) {
+  using freeink::gray16::kDecodeGray16;
+  using freeink::gray16::kMask4BitBw;
+  using freeink::gray16::kMask4BitGrayLsb;
+  using freeink::gray16::kMask4BitGrayMsb;
+  using freeink::gray16::kMaskBwClear;
+  using freeink::gray16::kMaskCleanupBlack;
+  using freeink::gray16::kMaskPass1Dtm1;
+  using freeink::gray16::kMaskPass1Dtm2;
+  using freeink::gray16::kMaskPass2Dtm1;
+  using freeink::gray16::kMaskPass2Dtm2;
+  using glyphBitmap::gray16ContrastMasks;
+  using glyphBitmap::Gray16MaskSet;
+  using glyphBitmap::sanitizeTextContrast;
+  using glyphBitmap::TextContrast;
+
+  // (a) Crisp preset (and out-of-range fallback) is 100% bit-identical to calibrated base masks.
+  const Gray16MaskSet& crisp = gray16ContrastMasks(TextContrast::Crisp);
+  EXPECT_EQ(kMaskBwClear, crisp.bwClear);
+  EXPECT_EQ(kMaskPass1Dtm1, crisp.pass1Dtm1);
+  EXPECT_EQ(kMaskPass1Dtm2, crisp.pass1Dtm2);
+  EXPECT_EQ(kMaskPass2Dtm1, crisp.pass2Dtm1);
+  EXPECT_EQ(kMaskPass2Dtm2, crisp.pass2Dtm2);
+  EXPECT_EQ(kMask4BitBw, crisp.bw4Bit);
+  EXPECT_EQ(kMask4BitGrayLsb, crisp.grayLsb4Bit);
+  EXPECT_EQ(kMask4BitGrayMsb, crisp.grayMsb4Bit);
+  EXPECT_EQ(TextContrast::Crisp, sanitizeTextContrast(99));
+
+  // (b) Render a 16-pixel 4bpp ramp [0..15] through all 4 presets and decode via kDecodeGray16[32].
+  const uint8_t ramp4bpp[8] = {0x01u, 0x23u, 0x45u, 0x67u, 0x89u, 0xABu, 0xCDu, 0xEFu};
+  const glyphBitmap::Clip clip16{0, 0, 16, 1};
+  const glyphBitmap::Frame frame{0, 0, 1, 0, 0, 1};
+
+  constexpr std::array<TextContrast, 4> PRESETS = {TextContrast::Light, TextContrast::Crisp, TextContrast::Medium,
+                                                   TextContrast::Dark};
+
+  auto runRampPlane = [&](Plane plane, uint8_t initVal, TextContrast contrast) -> uint16_t {
+    uint8_t row[STRIDE];
+    std::fill_n(row, STRIDE, initVal);
+    glyphBitmap::draw(ramp4bpp, 16, 1, uint8_t{4}, plane, true, {row, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip16,
+                      contrast);
+    uint16_t bitsByInk = 0;
+    for (int ink = 0; ink < 16; ++ink) {
+      if (((row[ink / 8] >> (7 - (ink % 8))) & 1u) != 0) {
+        bitsByInk |= static_cast<uint16_t>(1u << ink);
+      }
+    }
+    return bitsByInk;
+  };
+
+  for (TextContrast preset : PRESETS) {
+    const uint16_t bwBits = runRampPlane(Plane::Gray16BW, 0xFFu, preset);
+    const uint16_t cleanupBits = runRampPlane(Plane::Gray16CleanupDTM1, 0xFFu, preset);
+    const uint16_t cLsbBits = runRampPlane(Plane::Gray16CoarseLSB, 0x00u, preset);
+    const uint16_t cMsbBits = runRampPlane(Plane::Gray16CoarseMSB, 0x00u, preset);
+    const uint16_t fLsbBits = runRampPlane(Plane::Gray16FineLSB, 0x00u, preset);
+    const uint16_t fMsbBits = runRampPlane(Plane::Gray16FineMSB, 0x00u, preset);
+
+    // CleanupDTM1 clears ink 1..15 identically across all presets because remap(1..15) >= 1.
+    EXPECT_EQ(static_cast<uint16_t>(~kMaskCleanupBlack), cleanupBits) << static_cast<int>(preset);
+    // Transparent ink=0 and solid black ink=15 stay passive (0,0) in both Pass 1 and Pass 2.
+    EXPECT_EQ(0u, static_cast<uint16_t>((cLsbBits | cMsbBits | fLsbBits | fMsbBits) & 0x8001u))
+        << static_cast<int>(preset);
+
+    std::array<uint8_t, 16> decodedGray{};
+    for (int ink = 0; ink < 16; ++ink) {
+      const uint8_t code5 = static_cast<uint8_t>((((bwBits >> ink) & 1u) << 4) | (((cLsbBits >> ink) & 1u) << 3) |
+                                                 (((cMsbBits >> ink) & 1u) << 2) | (((fLsbBits >> ink) & 1u) << 1) |
+                                                 ((fMsbBits >> ink) & 1u));
+      decodedGray[ink] = kDecodeGray16[code5];
+    }
+
+    EXPECT_EQ(15u, decodedGray[0]) << "ink=0 must stay G15 white";
+    EXPECT_EQ(0u, decodedGray[15]) << "ink=15 must stay G00 solid black";
+    for (int ink = 0; ink < 15; ++ink) {
+      EXPECT_GE(decodedGray[ink], decodedGray[ink + 1])
+          << "preset=" << static_cast<int>(preset) << " non-monotonic at ink=" << ink;
+    }
+    if (preset == TextContrast::Crisp) {
+      for (int ink = 0; ink < 16; ++ink) {
+        EXPECT_EQ(static_cast<uint8_t>(15 - ink), decodedGray[ink]);
+      }
+    }
+  }
+
+  // (c) Optical ink density on test stem [0, 4, 12, 15, 8, 2, 0]: Dark > Medium > Crisp > Light.
+  // 7 pixels packed MSB-first into 4 bytes: (0,4), (12,15), (8,2), (0,0).
+  const uint8_t stem4bpp[4] = {0x04u, 0xCFu, 0x82u, 0x00u};
+  const glyphBitmap::Clip clip7{0, 0, 7, 1};
+  constexpr std::array<double, 16> CARTA_LIGHTNESS_PCT = {
+      0.00, 3.97, 9.32, 18.51, 22.45, 27.34, 35.61, 47.29, 49.30, 59.59, 70.36, 74.66, 83.93, 89.61, 94.28, 100.00,
+  };
+
+  auto measureStemDensity = [&](TextContrast contrast) -> std::pair<int, double> {
+    uint8_t bwRow[STRIDE], cLsbRow[STRIDE], cMsbRow[STRIDE], fLsbRow[STRIDE], fMsbRow[STRIDE];
+    std::fill_n(bwRow, STRIDE, 0xFFu);
+    std::fill_n(cLsbRow, STRIDE, 0x00u);
+    std::fill_n(cMsbRow, STRIDE, 0x00u);
+    std::fill_n(fLsbRow, STRIDE, 0x00u);
+    std::fill_n(fMsbRow, STRIDE, 0x00u);
+
+    glyphBitmap::draw(stem4bpp, 7, 1, uint8_t{4}, Plane::Gray16BW, true, {bwRow, PANEL_WIDTH, STRIDE, 0, 1, frame},
+                      clip7, contrast);
+    glyphBitmap::draw(stem4bpp, 7, 1, uint8_t{4}, Plane::Gray16CoarseLSB, true,
+                      {cLsbRow, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip7, contrast);
+    glyphBitmap::draw(stem4bpp, 7, 1, uint8_t{4}, Plane::Gray16CoarseMSB, true,
+                      {cMsbRow, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip7, contrast);
+    glyphBitmap::draw(stem4bpp, 7, 1, uint8_t{4}, Plane::Gray16FineLSB, true,
+                      {fLsbRow, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip7, contrast);
+    glyphBitmap::draw(stem4bpp, 7, 1, uint8_t{4}, Plane::Gray16FineMSB, true,
+                      {fMsbRow, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip7, contrast);
+
+    int digitalInkSum = 0;
+    double opticalAbsorptionSum = 0.0;
+    for (int x = 0; x < 7; ++x) {
+      const int shift = 7 - x;
+      const uint8_t code5 = static_cast<uint8_t>(
+          (((bwRow[0] >> shift) & 1u) << 4) | (((cLsbRow[0] >> shift) & 1u) << 3) |
+          (((cMsbRow[0] >> shift) & 1u) << 2) | (((fLsbRow[0] >> shift) & 1u) << 1) | ((fMsbRow[0] >> shift) & 1u));
+      const uint8_t gray = kDecodeGray16[code5];
+      if (x == 0 || x == 6) {
+        EXPECT_EQ(15u, gray) << "transparent flank must remain G15 white";
+      }
+      if (x == 3) {
+        EXPECT_EQ(0u, gray) << "stem center ink=15 must remain G00 black";
+      }
+      digitalInkSum += (15 - gray);
+      opticalAbsorptionSum += (100.0 - CARTA_LIGHTNESS_PCT[gray]);
+    }
+    return {digitalInkSum, opticalAbsorptionSum};
+  };
+
+  const auto [lightInk, lightOpt] = measureStemDensity(TextContrast::Light);
+  const auto [crispInk, crispOpt] = measureStemDensity(TextContrast::Crisp);
+  const auto [mediumInk, mediumOpt] = measureStemDensity(TextContrast::Medium);
+  const auto [darkInk, darkOpt] = measureStemDensity(TextContrast::Dark);
+
+  EXPECT_EQ(37, lightInk);
+  EXPECT_EQ(41, crispInk);
+  EXPECT_EQ(50, mediumInk);
+  EXPECT_EQ(56, darkInk);
+  EXPECT_GT(darkInk, mediumInk);
+  EXPECT_GT(mediumInk, crispInk);
+  EXPECT_GT(crispInk, lightInk);
+  EXPECT_GT(darkOpt, mediumOpt);
+  EXPECT_GT(mediumOpt, crispOpt);
+  EXPECT_GT(crispOpt, lightOpt);
+
+  // Verify 1bpp glyphs stay invariant across contrast presets on all planes, and 2bpp UI glyphs stay invariant
+  // across 4-gray planes (BW, GrayLSB, GrayMSB) and Gray16CleanupDTM1.
+  const uint8_t ui2bpp[1] = {0b00'01'10'11u};
+  const uint8_t ui1bpp[1] = {0b0110'0000u};
+  const glyphBitmap::Clip clip4{0, 0, 4, 1};
+  for (Plane plane : {Plane::BW, Plane::GrayLSB, Plane::GrayMSB, Plane::Gray16BW, Plane::Gray16CoarseLSB,
+                      Plane::Gray16CoarseMSB, Plane::Gray16FineLSB, Plane::Gray16FineMSB, Plane::Gray16CleanupDTM1}) {
+    const uint8_t initByte = planeUsesStatePolarity(plane) ? 0xFFu : 0x00u;
+    uint8_t base1[STRIDE], dark1[STRIDE], light1[STRIDE];
+    std::fill_n(base1, STRIDE, initByte);
+    std::fill_n(dark1, STRIDE, initByte);
+    std::fill_n(light1, STRIDE, initByte);
+    glyphBitmap::draw(ui1bpp, 4, 1, uint8_t{1}, plane, true, {base1, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip4,
+                      TextContrast::Crisp);
+    glyphBitmap::draw(ui1bpp, 4, 1, uint8_t{1}, plane, true, {dark1, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip4,
+                      TextContrast::Dark);
+    glyphBitmap::draw(ui1bpp, 4, 1, uint8_t{1}, plane, true, {light1, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip4,
+                      TextContrast::Light);
+    EXPECT_EQ(base1[0], dark1[0]) << "1bpp plane=" << static_cast<int>(plane);
+    EXPECT_EQ(base1[0], light1[0]) << "1bpp plane=" << static_cast<int>(plane);
+  }
+  for (Plane plane : {Plane::BW, Plane::GrayLSB, Plane::GrayMSB, Plane::Gray16CleanupDTM1}) {
+    const uint8_t initByte = planeUsesStatePolarity(plane) ? 0xFFu : 0x00u;
+    uint8_t base2[STRIDE], dark2[STRIDE], light2[STRIDE];
+    std::fill_n(base2, STRIDE, initByte);
+    std::fill_n(dark2, STRIDE, initByte);
+    std::fill_n(light2, STRIDE, initByte);
+    glyphBitmap::draw(ui2bpp, 4, 1, uint8_t{2}, plane, true, {base2, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip4,
+                      TextContrast::Crisp);
+    glyphBitmap::draw(ui2bpp, 4, 1, uint8_t{2}, plane, true, {dark2, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip4,
+                      TextContrast::Dark);
+    glyphBitmap::draw(ui2bpp, 4, 1, uint8_t{2}, plane, true, {light2, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip4,
+                      TextContrast::Light);
+    EXPECT_EQ(base2[0], dark2[0]) << "2bpp 4-gray/cleanup plane=" << static_cast<int>(plane);
+    EXPECT_EQ(base2[0], light2[0]) << "2bpp 4-gray/cleanup plane=" << static_cast<int>(plane);
+  }
+}
+
+TEST(GlyphBitmap, TwoBitGray16ContrastPresetsMatchSplitRailAnchorsAndMonotonicDensity) {
+  using freeink::gray16::kDecodeGray16;
+  using freeink::gray16::kMaskBwClear;
+  using freeink::gray16::kMaskCleanupBlack;
+  using freeink::gray16::kMaskPass1Dtm1;
+  using freeink::gray16::kMaskPass1Dtm2;
+  using freeink::gray16::kMaskPass2Dtm1;
+  using freeink::gray16::kMaskPass2Dtm2;
+  using freeink::gray16::mask2BitFrom4Bit;
+  using glyphBitmap::gray16ContrastMasks;
+  using glyphBitmap::Gray16MaskSet;
+  using glyphBitmap::TextContrast;
+
+  // (a) Crisp 2-bit Gray16 masks are 100% bit-identical to mask2BitFrom4Bit(kMask*).
+  const Gray16MaskSet& crisp = gray16ContrastMasks(TextContrast::Crisp);
+  EXPECT_EQ(mask2BitFrom4Bit(kMaskBwClear), crisp.bwClear2Bit);
+  EXPECT_EQ(mask2BitFrom4Bit(kMaskPass1Dtm1), crisp.pass1Dtm1_2Bit);
+  EXPECT_EQ(mask2BitFrom4Bit(kMaskPass1Dtm2), crisp.pass1Dtm2_2Bit);
+  EXPECT_EQ(mask2BitFrom4Bit(kMaskPass2Dtm1), crisp.pass2Dtm1_2Bit);
+  EXPECT_EQ(mask2BitFrom4Bit(kMaskPass2Dtm2), crisp.pass2Dtm2_2Bit);
+
+  // (b) Render a 4-pixel 2bpp ramp [0, 1, 2, 3] across all 4 presets and verify Split-Rail anchors:
+  //   Light:  {0, 3, 8, 15}  -> decoded gray {15, 12, 7, 0}, v=1 stays on White rail (bw=1)
+  //   Crisp:  {0, 6, 9, 15}  -> decoded gray {15, 9, 6, 0},  v=1 stays on White rail (bw=1)
+  //   Medium: {0, 7, 11, 15} -> decoded gray {15, 8, 4, 0},  v=1 stays on White rail (bw=1)
+  //   Dark:   {0, 9, 14, 15} -> decoded gray {15, 6, 1, 0},  v=1 enters Black rail (bw=0)
+  const uint8_t ramp2bpp[1] = {0b00'01'10'11u};
+  const glyphBitmap::Clip clip4{0, 0, 4, 1};
+  const glyphBitmap::Frame frame{0, 0, 1, 0, 0, 1};
+
+  struct PresetExpectation {
+    TextContrast preset;
+    std::array<uint8_t, 4> expectedInk;
+    uint8_t expectedV1BwBit;
+  };
+  constexpr std::array<PresetExpectation, 4> EXPECTATIONS = {{
+      {TextContrast::Light, {0, 3, 8, 15}, 1u},
+      {TextContrast::Crisp, {0, 6, 9, 15}, 1u},
+      {TextContrast::Medium, {0, 7, 11, 15}, 1u},
+      {TextContrast::Dark, {0, 9, 14, 15}, 0u},
+  }};
+
+  for (const auto& exp : EXPECTATIONS) {
+    uint8_t bwRow[STRIDE], clRow[STRIDE], cmRow[STRIDE], flRow[STRIDE], fmRow[STRIDE], cleanRow[STRIDE];
+    std::fill_n(bwRow, STRIDE, 0xFFu);
+    std::fill_n(clRow, STRIDE, 0x00u);
+    std::fill_n(cmRow, STRIDE, 0x00u);
+    std::fill_n(flRow, STRIDE, 0x00u);
+    std::fill_n(fmRow, STRIDE, 0x00u);
+    std::fill_n(cleanRow, STRIDE, 0xFFu);
+
+    glyphBitmap::draw(ramp2bpp, 4, 1, uint8_t{2}, Plane::Gray16BW, true, {bwRow, PANEL_WIDTH, STRIDE, 0, 1, frame},
+                      clip4, exp.preset);
+    glyphBitmap::draw(ramp2bpp, 4, 1, uint8_t{2}, Plane::Gray16CoarseLSB, true,
+                      {clRow, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip4, exp.preset);
+    glyphBitmap::draw(ramp2bpp, 4, 1, uint8_t{2}, Plane::Gray16CoarseMSB, true,
+                      {cmRow, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip4, exp.preset);
+    glyphBitmap::draw(ramp2bpp, 4, 1, uint8_t{2}, Plane::Gray16FineLSB, true, {flRow, PANEL_WIDTH, STRIDE, 0, 1, frame},
+                      clip4, exp.preset);
+    glyphBitmap::draw(ramp2bpp, 4, 1, uint8_t{2}, Plane::Gray16FineMSB, true, {fmRow, PANEL_WIDTH, STRIDE, 0, 1, frame},
+                      clip4, exp.preset);
+    glyphBitmap::draw(ramp2bpp, 4, 1, uint8_t{2}, Plane::Gray16CleanupDTM1, true,
+                      {cleanRow, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip4, exp.preset);
+
+    for (int v = 0; v < 4; ++v) {
+      const int shift = 7 - v;
+      const uint8_t bw = (bwRow[0] >> shift) & 1u;
+      const uint8_t cl = (clRow[0] >> shift) & 1u;
+      const uint8_t cm = (cmRow[0] >> shift) & 1u;
+      const uint8_t fl = (flRow[0] >> shift) & 1u;
+      const uint8_t fm = (fmRow[0] >> shift) & 1u;
+      const uint8_t cln = (cleanRow[0] >> shift) & 1u;
+      const uint8_t code5 = static_cast<uint8_t>((bw << 4) | (cl << 3) | (cm << 2) | (fl << 1) | fm);
+      EXPECT_EQ(static_cast<uint8_t>(15 - exp.expectedInk[v]), kDecodeGray16[code5])
+          << "preset=" << static_cast<int>(exp.preset) << " v=" << v;
+      EXPECT_EQ(v >= 1 ? 0u : 1u, cln) << "cleanup preset=" << static_cast<int>(exp.preset) << " v=" << v;
+      if (v == 1) {
+        EXPECT_EQ(exp.expectedV1BwBit, bw) << "preset=" << static_cast<int>(exp.preset);
+      }
+      if (v == 2 || v == 3) {
+        EXPECT_EQ(0u, bw) << "preset=" << static_cast<int>(exp.preset) << " v=" << v;
+      }
+      if (v == 0 || v == 3) {
+        EXPECT_EQ(0u, cl | cm | fl | fm) << "passive endpoints preset=" << static_cast<int>(exp.preset) << " v=" << v;
+      }
+    }
+
+    // Overlapping solid-black v=3 clears prior bleach bits across all presets:
+    uint8_t prefilled[STRIDE];
+    std::fill_n(prefilled, STRIDE, 0xFFu);
+    glyphBitmap::draw(ramp2bpp, 4, 1, uint8_t{2}, Plane::Gray16CoarseLSB, true,
+                      {prefilled, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip4, exp.preset);
+    EXPECT_EQ(0u, (prefilled[0] >> 4) & 1u) << "v=3 at x=3 must clear prior bleach bit";
+  }
+
+  // (c) Monotonic stem density on 2bpp stem [0, 1, 2, 3, 2, 1, 0]: Dark > Medium > Crisp > Light.
+  const uint8_t stem2bpp[2] = {0b00'01'10'11u, 0b10'01'00'00u};
+  const glyphBitmap::Clip clip7{0, 0, 7, 1};
+  constexpr std::array<double, 16> CARTA_LIGHTNESS_PCT = {
+      0.00, 3.97, 9.32, 18.51, 22.45, 27.34, 35.61, 47.29, 49.30, 59.59, 70.36, 74.66, 83.93, 89.61, 94.28, 100.00,
+  };
+  auto measure2BitStem = [&](TextContrast contrast) -> std::pair<int, double> {
+    uint8_t bwRow[STRIDE], clRow[STRIDE], cmRow[STRIDE], flRow[STRIDE], fmRow[STRIDE];
+    std::fill_n(bwRow, STRIDE, 0xFFu);
+    std::fill_n(clRow, STRIDE, 0x00u);
+    std::fill_n(cmRow, STRIDE, 0x00u);
+    std::fill_n(flRow, STRIDE, 0x00u);
+    std::fill_n(fmRow, STRIDE, 0x00u);
+    glyphBitmap::draw(stem2bpp, 7, 1, uint8_t{2}, Plane::Gray16BW, true, {bwRow, PANEL_WIDTH, STRIDE, 0, 1, frame},
+                      clip7, contrast);
+    glyphBitmap::draw(stem2bpp, 7, 1, uint8_t{2}, Plane::Gray16CoarseLSB, true,
+                      {clRow, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip7, contrast);
+    glyphBitmap::draw(stem2bpp, 7, 1, uint8_t{2}, Plane::Gray16CoarseMSB, true,
+                      {cmRow, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip7, contrast);
+    glyphBitmap::draw(stem2bpp, 7, 1, uint8_t{2}, Plane::Gray16FineLSB, true, {flRow, PANEL_WIDTH, STRIDE, 0, 1, frame},
+                      clip7, contrast);
+    glyphBitmap::draw(stem2bpp, 7, 1, uint8_t{2}, Plane::Gray16FineMSB, true, {fmRow, PANEL_WIDTH, STRIDE, 0, 1, frame},
+                      clip7, contrast);
+    int inkSum = 0;
+    double optSum = 0.0;
+    for (int x = 0; x < 7; ++x) {
+      const int shift = 7 - x;
+      const uint8_t code5 = static_cast<uint8_t>((((bwRow[0] >> shift) & 1u) << 4) | (((clRow[0] >> shift) & 1u) << 3) |
+                                                 (((cmRow[0] >> shift) & 1u) << 2) | (((flRow[0] >> shift) & 1u) << 1) |
+                                                 ((fmRow[0] >> shift) & 1u));
+      const uint8_t gray = kDecodeGray16[code5];
+      inkSum += (15 - gray);
+      optSum += (100.0 - CARTA_LIGHTNESS_PCT[gray]);
+    }
+    return {inkSum, optSum};
+  };
+
+  const auto [lightInk, lightOpt] = measure2BitStem(TextContrast::Light);
+  const auto [crispInk, crispOpt] = measure2BitStem(TextContrast::Crisp);
+  const auto [mediumInk, mediumOpt] = measure2BitStem(TextContrast::Medium);
+  const auto [darkInk, darkOpt] = measure2BitStem(TextContrast::Dark);
+
+  EXPECT_EQ(37, lightInk);   // 0 + 3 + 8 + 15 + 8 + 3 + 0
+  EXPECT_EQ(45, crispInk);   // 0 + 6 + 9 + 15 + 9 + 6 + 0
+  EXPECT_EQ(51, mediumInk);  // 0 + 7 + 11 + 15 + 11 + 7 + 0
+  EXPECT_EQ(61, darkInk);    // 0 + 9 + 14 + 15 + 14 + 9 + 0
+  EXPECT_GT(darkInk, mediumInk);
+  EXPECT_GT(mediumInk, crispInk);
+  EXPECT_GT(crispInk, lightInk);
+  EXPECT_GT(darkOpt, mediumOpt);
+  EXPECT_GT(mediumOpt, crispOpt);
+  EXPECT_GT(crispOpt, lightOpt);
+}
+
+TEST(GlyphBitmap, FourGrayPlanesApplyContrastPresetsMonotonicallyForFourBitGlyphs) {
+  using freeink::gray16::kMask4BitBw;
+  using freeink::gray16::kMask4BitGrayLsb;
+  using freeink::gray16::kMask4BitGrayMsb;
+  using glyphBitmap::TextContrast;
+
+  const uint8_t ramp4bpp[8] = {0x01u, 0x23u, 0x45u, 0x67u, 0x89u, 0xABu, 0xCDu, 0xEFu};
+  const glyphBitmap::Clip clip16{0, 0, 16, 1};
+  const glyphBitmap::Frame frame{0, 0, 1, 0, 0, 1};
+
+  auto runRampPlane = [&](Plane plane, uint8_t initVal, bool state, TextContrast contrast) -> uint16_t {
+    uint8_t row[STRIDE];
+    std::fill_n(row, STRIDE, initVal);
+    glyphBitmap::draw(ramp4bpp, 16, 1, uint8_t{4}, plane, state, {row, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip16,
+                      contrast);
+    uint16_t bitsByInk = 0;
+    for (int ink = 0; ink < 16; ++ink) {
+      if (((row[ink / 8] >> (7 - (ink % 8))) & 1u) != 0) {
+        bitsByInk |= static_cast<uint16_t>(1u << ink);
+      }
+    }
+    return bitsByInk;
+  };
+
+  // Crisp is bit-for-bit identical to {kMask4BitBw, kMask4BitGrayLsb, kMask4BitGrayMsb}.
+  EXPECT_EQ(static_cast<uint16_t>(~kMask4BitBw), runRampPlane(Plane::BW, 0xFFu, true, TextContrast::Crisp));
+  EXPECT_EQ(kMask4BitBw, runRampPlane(Plane::BW, 0x00u, false, TextContrast::Crisp));
+  EXPECT_EQ(kMask4BitGrayLsb, runRampPlane(Plane::GrayLSB, 0x00u, true, TextContrast::Crisp));
+  EXPECT_EQ(kMask4BitGrayMsb, runRampPlane(Plane::GrayMSB, 0x00u, true, TextContrast::Crisp));
+
+  // Decode OverlayMasks 4-gray ink (0 = white, 1 = light gray, 2 = dark gray, 3 = black).
+  auto decodeRamp4Gray = [&](TextContrast contrast) -> std::pair<std::array<uint8_t, 16>, int> {
+    const uint16_t bwBits = runRampPlane(Plane::BW, 0xFFu, true, contrast);
+    const uint16_t lsbBits = runRampPlane(Plane::GrayLSB, 0x00u, true, contrast);
+    const uint16_t msbBits = runRampPlane(Plane::GrayMSB, 0x00u, true, contrast);
+    std::array<uint8_t, 16> levels{};
+    int sum = 0;
+    for (int ink = 0; ink < 16; ++ink) {
+      const bool bwWhite = ((bwBits >> ink) & 1u) != 0;
+      const bool lsb = ((lsbBits >> ink) & 1u) != 0;
+      const bool msb = ((msbBits >> ink) & 1u) != 0;
+      if (bwWhite) {
+        EXPECT_FALSE(lsb);
+        EXPECT_FALSE(msb);
+        levels[ink] = 0;
+      } else if (!msb) {
+        EXPECT_FALSE(lsb);
+        levels[ink] = 3;
+      } else {
+        levels[ink] = lsb ? 2 : 1;
+      }
+      sum += levels[ink];
+    }
+    EXPECT_EQ(0u, levels[0]);
+    EXPECT_EQ(3u, levels[15]);
+    for (int ink = 0; ink < 15; ++ink) {
+      EXPECT_LE(levels[ink], levels[ink + 1]) << "contrast=" << static_cast<int>(contrast) << " ink=" << ink;
+    }
+    return {levels, sum};
+  };
+
+  const auto [lightLevels, lightRampSum] = decodeRamp4Gray(TextContrast::Light);
+  const auto [crispLevels, crispRampSum] = decodeRamp4Gray(TextContrast::Crisp);
+  const auto [mediumLevels, mediumRampSum] = decodeRamp4Gray(TextContrast::Medium);
+  const auto [darkLevels, darkRampSum] = decodeRamp4Gray(TextContrast::Dark);
+
+  for (int ink = 0; ink < 16; ++ink) {
+    EXPECT_LE(lightLevels[ink], crispLevels[ink]);
+    EXPECT_LE(crispLevels[ink], mediumLevels[ink]);
+    EXPECT_LE(mediumLevels[ink], darkLevels[ink]);
+  }
+  EXPECT_EQ(24, lightRampSum);
+  EXPECT_EQ(27, crispRampSum);
+  EXPECT_EQ(33, mediumRampSum);
+  EXPECT_EQ(37, darkRampSum);
+  EXPECT_GT(darkRampSum, mediumRampSum);
+  EXPECT_GT(mediumRampSum, crispRampSum);
+  EXPECT_GT(crispRampSum, lightRampSum);
+
+  // Subpixel-flank 4bpp stem [0, 1, 6, 12, 15, 10, 3, 0] across 4-gray planes: Dark > Medium > Crisp > Light.
+  const uint8_t stem4bpp[4] = {0x01u, 0x6Cu, 0xFAu, 0x30u};
+  const glyphBitmap::Clip clip8{0, 0, 8, 1};
+  auto measureStem4Gray = [&](TextContrast contrast) -> int {
+    uint8_t bwRow[STRIDE], lsbRow[STRIDE], msbRow[STRIDE];
+    std::fill_n(bwRow, STRIDE, 0xFFu);
+    std::fill_n(lsbRow, STRIDE, 0x00u);
+    std::fill_n(msbRow, STRIDE, 0x00u);
+    glyphBitmap::draw(stem4bpp, 8, 1, uint8_t{4}, Plane::BW, true, {bwRow, PANEL_WIDTH, STRIDE, 0, 1, frame}, clip8,
+                      contrast);
+    glyphBitmap::draw(stem4bpp, 8, 1, uint8_t{4}, Plane::GrayLSB, true, {lsbRow, PANEL_WIDTH, STRIDE, 0, 1, frame},
+                      clip8, contrast);
+    glyphBitmap::draw(stem4bpp, 8, 1, uint8_t{4}, Plane::GrayMSB, true, {msbRow, PANEL_WIDTH, STRIDE, 0, 1, frame},
+                      clip8, contrast);
+    int sum = 0;
+    for (int x = 0; x < 8; ++x) {
+      const int shift = 7 - x;
+      const bool bwWhite = ((bwRow[0] >> shift) & 1u) != 0;
+      const bool lsb = ((lsbRow[0] >> shift) & 1u) != 0;
+      const bool msb = ((msbRow[0] >> shift) & 1u) != 0;
+      sum += bwWhite ? 0 : (!msb ? 3 : (lsb ? 2 : 1));
+    }
+    return sum;
+  };
+
+  const int lightStem = measureStem4Gray(TextContrast::Light);
+  const int crispStem = measureStem4Gray(TextContrast::Crisp);
+  const int mediumStem = measureStem4Gray(TextContrast::Medium);
+  const int darkStem = measureStem4Gray(TextContrast::Dark);
+  EXPECT_EQ(9, lightStem);
+  EXPECT_EQ(10, crispStem);
+  EXPECT_EQ(13, mediumStem);
+  EXPECT_EQ(14, darkStem);
+  EXPECT_GT(darkStem, mediumStem);
+  EXPECT_GT(mediumStem, crispStem);
+  EXPECT_GT(crispStem, lightStem);
+}
+
+TEST(GlyphBitmap, Portrait4BitFastPathBitExactAgainstScalarPaintAcrossPlanesContrastsOffsetsWidthsAndClips) {
+  using freeink::gray16::kMaskCleanupBlack;
+  using glyphBitmap::gray16ContrastMasks;
+  using glyphBitmap::Gray16MaskSet;
+  using glyphBitmap::TextContrast;
+
   constexpr int FUZZ_WIDTH = 96;
   constexpr int FUZZ_HEIGHT = 12;
   constexpr int FUZZ_STRIDE = FUZZ_WIDTH / 8;
@@ -382,13 +838,19 @@ TEST(GlyphBitmap, Portrait4BitFastPathBitExactAgainstScalarPaintAcrossPlanesOffs
       Plane::Gray16FineMSB,
       Plane::Gray16CleanupDTM1,
   };
+  constexpr std::array<TextContrast, 4> ALL_CONTRASTS = {
+      TextContrast::Light,
+      TextContrast::Crisp,
+      TextContrast::Medium,
+      TextContrast::Dark,
+  };
 
-  auto computeMasks = [](Plane plane, bool state) -> std::pair<uint16_t, uint16_t> {
+  auto computeMasks = [](Plane plane, bool state, TextContrast contrast) -> std::pair<uint16_t, uint16_t> {
+    const Gray16MaskSet& m = gray16ContrastMasks(contrast);
     uint16_t setMask = 0;
     uint16_t clearMask = 0;
-    const uint16_t solidBlackBit = !state ? 0u
-                                          : static_cast<uint16_t>(kMaskBwClear & ~(kMaskPass1Dtm1 | kMaskPass1Dtm2 |
-                                                                                   kMaskPass2Dtm1 | kMaskPass2Dtm2));
+    const uint16_t solidBlackBit =
+        !state ? 0u : static_cast<uint16_t>(m.bwClear & ~(m.pass1Dtm1 | m.pass1Dtm2 | m.pass2Dtm1 | m.pass2Dtm2));
     auto applyPolarity = [&](uint16_t levels) {
       if (state)
         clearMask = levels;
@@ -397,31 +859,31 @@ TEST(GlyphBitmap, Portrait4BitFastPathBitExactAgainstScalarPaintAcrossPlanesOffs
     };
     switch (plane) {
       case Plane::BW:
-        applyPolarity(kMask4BitBw);
+        applyPolarity(m.bw4Bit);
         break;
       case Plane::GrayLSB:
-        setMask = kMask4BitGrayLsb;
+        setMask = m.grayLsb4Bit;
         break;
       case Plane::GrayMSB:
-        setMask = kMask4BitGrayMsb;
+        setMask = m.grayMsb4Bit;
         break;
       case Plane::Gray16BW:
-        applyPolarity(kMaskBwClear);
+        applyPolarity(m.bwClear);
         break;
       case Plane::Gray16CoarseLSB:
-        setMask = kMaskPass1Dtm1;
+        setMask = m.pass1Dtm1;
         clearMask = solidBlackBit;
         break;
       case Plane::Gray16CoarseMSB:
-        setMask = kMaskPass1Dtm2;
+        setMask = m.pass1Dtm2;
         clearMask = solidBlackBit;
         break;
       case Plane::Gray16FineLSB:
-        setMask = kMaskPass2Dtm1;
+        setMask = m.pass2Dtm1;
         clearMask = solidBlackBit;
         break;
       case Plane::Gray16FineMSB:
-        setMask = kMaskPass2Dtm2;
+        setMask = m.pass2Dtm2;
         clearMask = solidBlackBit;
         break;
       case Plane::Gray16CleanupDTM1:
@@ -445,65 +907,69 @@ TEST(GlyphBitmap, Portrait4BitFastPathBitExactAgainstScalarPaintAcrossPlanesOffs
 
   constexpr int GLYPH_H = 4;
   for (Plane plane : ALL_PLANES) {
-    for (bool state : {true, false}) {
-      const auto [setMask, clearMask] = computeMasks(plane, state);
-      for (int width = 1; width <= 48; ++width) {
-        bitmap.resize((width * GLYPH_H + 1) / 2);
-        for (size_t i = 0; i < bitmap.size(); ++i) {
-          bitmap[i] = nextByte();
-        }
-        // Embed a full zero span in row 1 to exercise the zeroTransparent 8-pixel skip.
-        for (int gx = 0; gx < width; ++gx) {
-          const int srcIdx = 1 * width + gx;
-          if (srcIdx & 1)
-            bitmap[srcIdx >> 1] &= 0xF0u;
-          else
-            bitmap[srcIdx >> 1] &= 0x0Fu;
-        }
-        if ((width * GLYPH_H) & 1) {
-          bitmap.back() &= 0xF0u;
-        }
+    for (TextContrast contrast : ALL_CONTRASTS) {
+      for (bool state : {true, false}) {
+        const auto [setMask, clearMask] = computeMasks(plane, state, contrast);
+        for (int width = 1; width <= 48; ++width) {
+          bitmap.resize((width * GLYPH_H + 1) / 2);
+          for (size_t i = 0; i < bitmap.size(); ++i) {
+            bitmap[i] = nextByte();
+          }
+          // Embed a full zero span in row 1 to exercise the zeroTransparent 8-pixel skip.
+          for (int gx = 0; gx < width; ++gx) {
+            const int srcIdx = 1 * width + gx;
+            if (srcIdx & 1)
+              bitmap[srcIdx >> 1] &= 0xF0u;
+            else
+              bitmap[srcIdx >> 1] &= 0x0Fu;
+          }
+          if ((width * GLYPH_H) & 1) {
+            bitmap.back() &= 0xF0u;
+          }
 
-        const std::array<std::pair<int, int>, 4> clips = {{
-            {0, width},
-            {1, std::max(1, width - 1)},
-            {2, std::max(2, width - 3)},
-            {std::min(width, 5), std::max(std::min(width, 5), width - 4)},
-        }};
+          const std::array<std::pair<int, int>, 4> clips = {{
+              {0, width},
+              {1, std::max(1, width - 1)},
+              {2, std::max(2, width - 3)},
+              {std::min(width, 5), std::max(std::min(width, 5), width - 4)},
+          }};
 
-        for (int x = 0; x <= 15; ++x) {
-          for (const auto [clipL, clipR] : clips) {
-            for (size_t i = 0; i < expected.size(); ++i) {
-              expected[i] = static_cast<uint8_t>(i * 41u + x * 13u + width * 7u + 0x5Au);
-            }
-            actual = expected;
-
-            const int placeX =
-                (clipL == 2 && width >= 24) ? (FUZZ_WIDTH - width + 5) : (clipL == 1 && width >= 16 ? -3 + (x & 3) : x);
-            const int placeY = 2;
-            const glyphBitmap::Frame frame{placeX, placeY, 1, 0, 0, 1};
-            const glyphBitmap::Target target{
-                actual.data() + GUARD_BYTES, FUZZ_WIDTH, FUZZ_STRIDE, 0, FUZZ_HEIGHT, frame};
-            const glyphBitmap::Clip clip{clipL, 0, clipR, GLYPH_H};
-
-            glyphBitmap::draw(bitmap.data(), width, GLYPH_H, 4, plane, state, target, clip);
-
-            // Independent scalar reference using glyphBitmap::paint() per pixel.
-            for (int gy = std::max(0, clip.top); gy < std::min(GLYPH_H, clip.bottom); ++gy) {
-              const int py = placeY + gy;
-              if (py < 0 || py >= FUZZ_HEIGHT) continue;
-              for (int gx = std::max(0, clip.left); gx < std::min(width, clip.right); ++gx) {
-                const int px = placeX + gx;
-                if (px < 0 || px >= FUZZ_WIDTH) continue;
-                const int srcIdx = gy * width + gx;
-                const uint8_t ink = (srcIdx & 1) ? (bitmap[srcIdx >> 1] & 0x0Fu) : (bitmap[srcIdx >> 1] >> 4);
-                glyphBitmap::paint(expected.data() + GUARD_BYTES, py * (FUZZ_STRIDE * 8) + px, ink, setMask, clearMask);
+          for (int x = 0; x <= 15; ++x) {
+            for (const auto [clipL, clipR] : clips) {
+              for (size_t i = 0; i < expected.size(); ++i) {
+                expected[i] = static_cast<uint8_t>(i * 41u + x * 13u + width * 7u + 0x5Au);
               }
-            }
+              actual = expected;
 
-            ASSERT_EQ(expected, actual) << "plane=" << static_cast<int>(plane) << " state=" << state
-                                        << " width=" << width << " x=" << x << " placeX=" << placeX << " clip=["
-                                        << clipL << "," << clipR << ")";
+              const int placeX = (clipL == 2 && width >= 24) ? (FUZZ_WIDTH - width + 5)
+                                                             : (clipL == 1 && width >= 16 ? -3 + (x & 3) : x);
+              const int placeY = 2;
+              const glyphBitmap::Frame frame{placeX, placeY, 1, 0, 0, 1};
+              const glyphBitmap::Target target{
+                  actual.data() + GUARD_BYTES, FUZZ_WIDTH, FUZZ_STRIDE, 0, FUZZ_HEIGHT, frame};
+              const glyphBitmap::Clip clip{clipL, 0, clipR, GLYPH_H};
+
+              glyphBitmap::draw(bitmap.data(), width, GLYPH_H, uint8_t{4}, plane, state, target, clip, contrast);
+
+              // Independent scalar reference using glyphBitmap::paint() per pixel.
+              for (int gy = std::max(0, clip.top); gy < std::min(GLYPH_H, clip.bottom); ++gy) {
+                const int py = placeY + gy;
+                if (py < 0 || py >= FUZZ_HEIGHT) continue;
+                for (int gx = std::max(0, clip.left); gx < std::min(width, clip.right); ++gx) {
+                  const int px = placeX + gx;
+                  if (px < 0 || px >= FUZZ_WIDTH) continue;
+                  const int srcIdx = gy * width + gx;
+                  const uint8_t ink = (srcIdx & 1) ? (bitmap[srcIdx >> 1] & 0x0Fu) : (bitmap[srcIdx >> 1] >> 4);
+                  glyphBitmap::paint(expected.data() + GUARD_BYTES, py * (FUZZ_STRIDE * 8) + px, ink, setMask,
+                                     clearMask);
+                }
+              }
+
+              ASSERT_EQ(expected, actual)
+                  << "plane=" << static_cast<int>(plane) << " contrast=" << static_cast<int>(contrast)
+                  << " state=" << state << " width=" << width << " x=" << x << " placeX=" << placeX << " clip=["
+                  << clipL << "," << clipR << ")";
+            }
           }
         }
       }
@@ -512,60 +978,63 @@ TEST(GlyphBitmap, Portrait4BitFastPathBitExactAgainstScalarPaintAcrossPlanesOffs
 
   // Also fuzz the rotated-Portrait 8-row vertical byte-accumulated fast path
   // (dxX == 0, dxY == -1 / +1, dyX == +1, dyY == 0) across widths 1..19, heights 1..48,
-  // all 3 planes, bit offsets 0..15, and 4-side clipping bounds.
+  // all 9 planes, all 4 contrasts, bit offsets 0..15, and 4-side clipping bounds.
   constexpr int ROT_W = 64;
   constexpr int ROT_H = 56;
   constexpr int ROT_STRIDE = ROT_W / 8;
   expected.resize(ROT_H * ROT_STRIDE + 2 * GUARD_BYTES);
   actual.resize(expected.size());
   for (Plane plane : ALL_PLANES) {
-    for (bool state : {true, false}) {
-      const auto [setMask, clearMask] = computeMasks(plane, state);
-      for (int dxY : {-1, 1}) {
-        for (int height : {1, 2, 7, 8, 9, 15, 16, 17, 23, 24, 25, 33, 48}) {
-          for (int width : {1, 2, 3, 4, 7, 8, 9, 15, 16, 19}) {
-            bitmap.resize((width * height + 1) / 2);
-            for (size_t i = 0; i < bitmap.size(); ++i) bitmap[i] = nextByte();
-            // Zero-out column 0 to exercise zeroTransparent 8-row column skip.
-            for (int gy = 0; gy < height; ++gy) {
-              const int sIdx = gy * width;
-              if (sIdx & 1)
-                bitmap[sIdx >> 1] &= 0xF0u;
-              else
-                bitmap[sIdx >> 1] &= 0x0Fu;
-            }
-            if ((width * height) & 1) bitmap.back() &= 0xF0u;
+    for (TextContrast contrast : ALL_CONTRASTS) {
+      for (bool state : {true, false}) {
+        const auto [setMask, clearMask] = computeMasks(plane, state, contrast);
+        for (int dxY : {-1, 1}) {
+          for (int height : {1, 2, 7, 8, 9, 15, 16, 17, 23, 24, 25, 33, 48}) {
+            for (int width : {1, 2, 3, 4, 7, 8, 9, 15, 16, 19}) {
+              bitmap.resize((width * height + 1) / 2);
+              for (size_t i = 0; i < bitmap.size(); ++i) bitmap[i] = nextByte();
+              // Zero-out column 0 to exercise zeroTransparent 8-row column skip.
+              for (int gy = 0; gy < height; ++gy) {
+                const int sIdx = gy * width;
+                if (sIdx & 1)
+                  bitmap[sIdx >> 1] &= 0xF0u;
+                else
+                  bitmap[sIdx >> 1] &= 0x0Fu;
+              }
+              if ((width * height) & 1) bitmap.back() &= 0xF0u;
 
-            for (int physX : {0, 1, 2, 3, 5, 7, 8, 11, 15}) {
-              for (const auto [clipTop, clipBottom] : {std::pair{0, height}, std::pair{1, std::max(1, height - 2)},
-                                                       std::pair{3, std::max(3, height - 5)}}) {
-                for (const auto [clipL, clipR] : {std::pair{0, width}, std::pair{1, std::max(1, width - 1)}}) {
-                  for (size_t i = 0; i < expected.size(); ++i) {
-                    expected[i] = static_cast<uint8_t>(i * 29u + physX * 17u + height * 5u + 0xA3u);
-                  }
-                  actual = expected;
-                  const int physY = dxY < 0 ? (ROT_H - 3) : 2;
-                  const glyphBitmap::Frame frame{physX, physY, 0, dxY, 1, 0};
-                  const glyphBitmap::Target target{actual.data() + GUARD_BYTES, ROT_W, ROT_STRIDE, 0, ROT_H, frame};
-                  const glyphBitmap::Clip clip{clipL, clipTop, clipR, clipBottom};
-
-                  glyphBitmap::draw(bitmap.data(), width, height, 4, plane, state, target, clip);
-
-                  for (int gy = std::max(0, clip.top); gy < std::min(height, clip.bottom); ++gy) {
-                    const int px = physX + gy;
-                    if (px < 0 || px >= ROT_W) continue;
-                    for (int gx = std::max(0, clip.left); gx < std::min(width, clip.right); ++gx) {
-                      const int py = physY + gx * dxY;
-                      if (py < 0 || py >= ROT_H) continue;
-                      const int srcIdx = gy * width + gx;
-                      const uint8_t ink = (srcIdx & 1) ? (bitmap[srcIdx >> 1] & 0x0Fu) : (bitmap[srcIdx >> 1] >> 4);
-                      glyphBitmap::paint(expected.data() + GUARD_BYTES, py * (ROT_STRIDE * 8) + px, ink, setMask,
-                                         clearMask);
+              for (int physX : {0, 1, 2, 3, 5, 7, 8, 11, 15}) {
+                for (const auto [clipTop, clipBottom] : {std::pair{0, height}, std::pair{1, std::max(1, height - 2)},
+                                                         std::pair{3, std::max(3, height - 5)}}) {
+                  for (const auto [clipL, clipR] : {std::pair{0, width}, std::pair{1, std::max(1, width - 1)}}) {
+                    for (size_t i = 0; i < expected.size(); ++i) {
+                      expected[i] = static_cast<uint8_t>(i * 29u + physX * 17u + height * 5u + 0xA3u);
                     }
-                  }
+                    actual = expected;
+                    const int physY = dxY < 0 ? (ROT_H - 3) : 2;
+                    const glyphBitmap::Frame frame{physX, physY, 0, dxY, 1, 0};
+                    const glyphBitmap::Target target{actual.data() + GUARD_BYTES, ROT_W, ROT_STRIDE, 0, ROT_H, frame};
+                    const glyphBitmap::Clip clip{clipL, clipTop, clipR, clipBottom};
 
-                  ASSERT_EQ(expected, actual) << "RotatedPortrait plane=" << static_cast<int>(plane) << " dxY=" << dxY
-                                              << " w=" << width << " h=" << height << " physX=" << physX;
+                    glyphBitmap::draw(bitmap.data(), width, height, uint8_t{4}, plane, state, target, clip, contrast);
+
+                    for (int gy = std::max(0, clip.top); gy < std::min(height, clip.bottom); ++gy) {
+                      const int px = physX + gy;
+                      if (px < 0 || px >= ROT_W) continue;
+                      for (int gx = std::max(0, clip.left); gx < std::min(width, clip.right); ++gx) {
+                        const int py = physY + gx * dxY;
+                        if (py < 0 || py >= ROT_H) continue;
+                        const int srcIdx = gy * width + gx;
+                        const uint8_t ink = (srcIdx & 1) ? (bitmap[srcIdx >> 1] & 0x0Fu) : (bitmap[srcIdx >> 1] >> 4);
+                        glyphBitmap::paint(expected.data() + GUARD_BYTES, py * (ROT_STRIDE * 8) + px, ink, setMask,
+                                           clearMask);
+                      }
+                    }
+
+                    ASSERT_EQ(expected, actual) << "RotatedPortrait plane=" << static_cast<int>(plane)
+                                                << " contrast=" << static_cast<int>(contrast) << " dxY=" << dxY
+                                                << " w=" << width << " h=" << height << " physX=" << physX;
+                  }
                 }
               }
             }

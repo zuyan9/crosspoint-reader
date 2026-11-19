@@ -99,6 +99,7 @@ class EpubReaderActivity final : public ReaderActivity {
     uint16_t panelHeight = 0;
     size_t clippingCount = 0;
     uint8_t orientation = 0;
+    uint8_t textContrast = 0;
     uint8_t textAntiAliasing = 0;
     uint8_t imageRendering = 0;
     bool screenInverted = false;

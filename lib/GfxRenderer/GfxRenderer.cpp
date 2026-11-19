@@ -666,7 +666,7 @@ void GfxRenderer::drawGlyphBitmap(const uint8_t* bitmap, const int width, const 
       return;
 #endif
   }
-  glyphBitmap::draw(bitmap, width, height, bitsPerPixel, plane, state, target, clip);
+  glyphBitmap::draw(bitmap, width, height, bitsPerPixel, plane, state, target, clip, textContrast_);
 }
 
 // IMPORTANT: This function is in critical rendering path and is called for every pixel. Please keep it as simple and
