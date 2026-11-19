@@ -142,14 +142,23 @@ static bool deepSleepInProgress = false;
 static unsigned long lastInputTime = 0;
 
 // Screens that block auto-sleep can hold one static image for as long as they
-// run. Once input stops, power the panel down as sleep does; the next paint wakes it.
-// The EEGO A4 does this on every screen, as its stock firmware does: its panel
-// fuzzes and shows earlier screens when left powered. Its driver times the
-// power-off itself, 500 ms after the last refresh, whatever the input does.
-static void idleDisplayWhileAwake() {
-  if (!BoardConfig::isEegoA4() && (!activityManager.preventAutoSleep() || millis() - lastInputTime < 30000)) return;
+// run. Service non-destructive post-settle HV rail shutoff (X3 1.2 s POF) on all
+// idle screens, and enter deep controller idle after 30 s when auto-sleep is blocked
+// (or on every screen for EEGO A4, whose driver times its own 500 ms power-off).
+static void idleDisplayWhileAwake(const bool userInput = false) {
+  constexpr unsigned long kIdleAfterMs = 30000;
+  const bool wantControllerIdle =
+      BoardConfig::isEegoA4() || (activityManager.preventAutoSleep() && millis() - lastInputTime >= kIdleAfterMs);
+#if !defined(FREEINK_DEVICE_X3) || FREEINK_DEVICE_X3
+  const bool wantIdlePowerService = !userInput && gpio.deviceIsX3();
+#else
+  constexpr bool wantIdlePowerService = false;
+#endif
+  if (!wantControllerIdle && !wantIdlePowerService) return;
   RenderLock lock(RenderLock::Mode::Try);
-  if (lock.ownsLock()) display.controllerIdle();
+  if (!lock.ownsLock()) return;
+  if (wantIdlePowerService) display.serviceIdlePower();
+  if (wantControllerIdle) display.controllerIdle();
 }
 
 // A silent restart is internal maintenance, so the light must come back exactly
@@ -942,7 +951,7 @@ void loop() {
   const bool userInput = gpio.wasAnyPressed() || gpio.wasAnyReleased() || gpio.wasTouchActivity() ||
                          halTiltSensor.hadActivity() || remoteActed;
   if (userInput) lastInputTime = millis();
-  idleDisplayWhileAwake();
+  idleDisplayWhileAwake(userInput);
   if (userInput || activityManager.preventAutoSleep()) {
     lastActivityTime = millis();         // Reset inactivity timer
     powerManager.setPowerSaving(false);  // Restore normal CPU frequency on user activity

@@ -62,6 +62,10 @@ void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen)
   einkDisplay.displayBuffer(convertRefreshMode(mode), turnOffScreen);
 }
 
+void HalDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool turnOffScreen) {
+  einkDisplay.displayWindow(x, y, w, h, turnOffScreen);
+}
+
 void HalDisplay::displayBufferAsync(HalDisplay::RefreshMode mode) {
   if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
     einkDisplay.requestResync(1);
@@ -82,6 +86,14 @@ void HalDisplay::setInverted(bool inverted) { einkDisplay.setInverted(inverted);
 
 bool HalDisplay::isInverted() const { return einkDisplay.isInverted(); }
 
+#if CROSSPOINT_SUPPORT_GRAY16
+bool HalDisplay::prewarmPowerOn() { return einkDisplay.prewarmPowerOn(); }
+
+bool HalDisplay::serviceIdlePower() { return einkDisplay.serviceIdlePower(); }
+#endif
+
+void HalDisplay::powerOffBetweenFrames() { einkDisplay.powerOffBetweenFrames(); }
+
 void HalDisplay::deepSleep() { einkDisplay.deepSleep(); }
 
 void HalDisplay::controllerIdle() { einkDisplay.controllerIdle(); }
@@ -93,23 +105,27 @@ uint8_t* HalDisplay::lendFrameBufferStorage(uint32_t* sizeOut) { return einkDisp
 void HalDisplay::returnFrameBufferStorage() { einkDisplay.returnBuildStorage(); }
 
 bool HalDisplay::displayGrayscaleBase(GrayscaleMode mode, RefreshMode fallback, bool turnOffScreen) {
-  if (gpio.deviceIsX3() && fallback == HALF_REFRESH) einkDisplay.requestResync();
-  return einkDisplay.displayGrayscaleBase(mode, static_cast<EInkDisplay::RefreshMode>(fallback), turnOffScreen);
+  if (gpio.deviceIsX3() && (fallback == FULL_REFRESH || fallback == HALF_REFRESH)) {
+    einkDisplay.requestResync(1);
+  }
+  return einkDisplay.displayGrayscaleBase(mode, convertRefreshMode(fallback), turnOffScreen);
 }
 
 void HalDisplay::displayGrayscaleBase(RefreshMode fallback, bool turnOffScreen) {
-  // X3: a HALF fallback means the caller wants a clean base (e.g. the sleep
-  // cover, a full-screen swap from arbitrary prior content). Without this, the
-  // X3 grayscale base takes its gentle differential happy path and the prior
-  // home/reader frame ghosts through the soft aa_pre_bw_mid waveform. Forcing a
-  // resync makes displayGrayscaleBase clear first, matching displayBuffer(HALF).
-  // The reader's FAST path is deliberately left on the differential path so
-  // per-page grayscale stays cheap.
-  if (gpio.deviceIsX3() && fallback == RefreshMode::HALF_REFRESH) {
+  if (gpio.deviceIsX3() && (fallback == RefreshMode::FULL_REFRESH || fallback == RefreshMode::HALF_REFRESH)) {
     einkDisplay.requestResync(1);
   }
 
   einkDisplay.displayGrayscaleBase(convertRefreshMode(fallback), turnOffScreen);
+}
+
+bool HalDisplay::supportsDeferredGrayscaleBase() const { return einkDisplay.supportsDeferredGrayscaleBase(); }
+
+bool HalDisplay::displayGrayscaleBaseAsync(RefreshMode fallback) {
+  if (gpio.deviceIsX3() && (fallback == RefreshMode::FULL_REFRESH || fallback == RefreshMode::HALF_REFRESH)) {
+    einkDisplay.requestResync(1);
+  }
+  return einkDisplay.displayGrayscaleBaseAsync(convertRefreshMode(fallback));
 }
 
 void HalDisplay::preconditionGrayscale() { einkDisplay.preconditionGrayscale(); }
@@ -126,9 +142,56 @@ void HalDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) { einkDisplay.
 
 void HalDisplay::displayGrayBuffer(bool turnOffScreen) { einkDisplay.displayGrayBuffer(turnOffScreen); }
 
+#if CROSSPOINT_SUPPORT_GRAY16
+bool HalDisplay::supportsGray16Planes() const { return einkDisplay.supportsGray16Planes(); }
+
+bool HalDisplay::supportsDeferredGray16Base() const { return einkDisplay.supportsDeferredGray16Base(); }
+
+void HalDisplay::displayGray16Base(RefreshMode fallback, bool turnOffScreen) {
+  // X3 with Gray16 runs a single-DRF DC-balanced bipolar GC scrub natively on
+  // HALF_REFRESH; only FULL_REFRESH (or non-Gray16 / inverted modes) needs the
+  // multi-pass requestResync(1) clear.
+  if (gpio.deviceIsX3() && (fallback == RefreshMode::FULL_REFRESH ||
+                            (fallback == RefreshMode::HALF_REFRESH && !einkDisplay.supportsGray16Planes()))) {
+    einkDisplay.requestResync(1);
+  }
+  einkDisplay.displayGray16Base(convertRefreshMode(fallback), turnOffScreen);
+}
+
+bool HalDisplay::displayGray16BaseAsync(RefreshMode fallback) {
+  if (gpio.deviceIsX3() && (fallback == RefreshMode::FULL_REFRESH ||
+                            (fallback == RefreshMode::HALF_REFRESH && !einkDisplay.supportsGray16Planes()))) {
+    einkDisplay.requestResync(1);
+  }
+  return einkDisplay.displayGray16BaseAsync(convertRefreshMode(fallback));
+}
+
+void HalDisplay::displayGray16Pass1() { einkDisplay.displayGray16Pass1(); }
+
+bool HalDisplay::displayGray16Pass1Async() { return einkDisplay.displayGray16Pass1Async(); }
+
+void HalDisplay::displayGray16Pass2(bool turnOffScreen) { einkDisplay.displayGray16Pass2(turnOffScreen); }
+
+bool HalDisplay::displayGray16Pass2Async(bool turnOffScreen) {
+  return einkDisplay.displayGray16Pass2Async(turnOffScreen);
+}
+
+void HalDisplay::beginGray16Cleanup(const uint8_t* bwBuffer) { einkDisplay.beginGray16Cleanup(bwBuffer); }
+
+void HalDisplay::finishGray16Cleanup() { einkDisplay.finishGray16Cleanup(); }
+#endif
+
+bool HalDisplay::displayCommitted() const { return einkDisplay.displayCommitted(); }
+
 void HalDisplay::writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* rows, uint16_t yStart, uint16_t numRows) {
   einkDisplay.writeGrayscalePlaneStrip(lsbPlane ? EInkDisplay::GRAY_PLANE_LSB : EInkDisplay::GRAY_PLANE_MSB, rows,
                                        yStart, numRows);
+}
+
+bool HalDisplay::writeGrayscalePlaneGateStream(bool lsbPlane, void* ctx,
+                                               size_t (*nextChunk)(void* ctx, const uint8_t** outChunk)) {
+  return einkDisplay.writeGrayscalePlaneGateStream(lsbPlane ? EInkDisplay::GRAY_PLANE_LSB : EInkDisplay::GRAY_PLANE_MSB,
+                                                   ctx, nextChunk);
 }
 
 uint16_t HalDisplay::getDisplayWidth() const { return einkDisplay.getDisplayWidth(); }

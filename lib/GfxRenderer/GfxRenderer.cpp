@@ -17,6 +17,7 @@
 #include <Utf8.h>
 
 #include <algorithm>
+#include <cassert>
 
 #include "../Memory/Memory.h"
 #include "FontCacheManager.h"
@@ -631,9 +632,40 @@ void GfxRenderer::drawGlyphBitmap(const uint8_t* bitmap, const int width, const 
   physical.dyX = nextX - physical.x;
   physical.dyY = nextY - physical.y;
 
-  const glyphBitmap::Plane plane = mode == BW              ? glyphBitmap::Plane::BW
-                                   : mode == GRAYSCALE_MSB ? glyphBitmap::Plane::GrayMSB
-                                                           : glyphBitmap::Plane::GrayLSB;
+  glyphBitmap::Plane plane = glyphBitmap::Plane::BW;
+  switch (mode) {
+    case BW:
+#if CROSSPOINT_SUPPORT_GRAY16
+      plane = gray16BaseActive_ ? glyphBitmap::Plane::Gray16BW : glyphBitmap::Plane::BW;
+#endif
+      break;
+    case GRAYSCALE_LSB:
+      plane = glyphBitmap::Plane::GrayLSB;
+      break;
+    case GRAYSCALE_MSB:
+      plane = glyphBitmap::Plane::GrayMSB;
+      break;
+#if CROSSPOINT_SUPPORT_GRAY16
+    case GRAY16_COARSE_LSB:
+      plane = glyphBitmap::Plane::Gray16CoarseLSB;
+      break;
+    case GRAY16_COARSE_MSB:
+      plane = glyphBitmap::Plane::Gray16CoarseMSB;
+      break;
+    case GRAY16_FINE_LSB:
+      plane = glyphBitmap::Plane::Gray16FineLSB;
+      break;
+    case GRAY16_FINE_MSB:
+      plane = glyphBitmap::Plane::Gray16FineMSB;
+      break;
+    case GRAY16_CLEANUP_DTM1:
+      plane = glyphBitmap::Plane::Gray16CleanupDTM1;
+      break;
+#else
+    default:
+      return;
+#endif
+  }
   glyphBitmap::draw(bitmap, width, height, bitsPerPixel, plane, state, target, clip);
 }
 
@@ -720,12 +752,20 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
     return;
   }
 
-  // Route non-Latin strings to the fallback font when the requested font
-  // lacks the glyphs (e.g. Chinese book titles drawn with a Latin UI font).
-  const int resolvedFontId = resolveTextFontId(fontId, text, style);
+  bool pureAscii = true;
+  for (const auto* p = reinterpret_cast<const unsigned char*>(text); *p != 0; ++p) {
+    if (*p >= 0x80u) {
+      pureAscii = false;
+      break;
+    }
+  }
 
+  // ASCII never triggers script fallback or Bidi/Indic shaping outside explicit RTL runs.
+  const int resolvedFontId = pureAscii ? fontId : resolveTextFontId(fontId, text, style);
   std::string visual;
-  const VisualText visualText = resolveVisualText(text, visual, baseDir, fontMap, resolvedFontId, style);
+  const VisualText visualText = (pureAscii && baseDir != BidiUtils::BidiBaseDir::RTL)
+                                    ? VisualText{text, false}
+                                    : resolveVisualText(text, visual, baseDir, fontMap, resolvedFontId, style);
   drawVisualText(fontId, resolvedFontId, x, y, visualText.text, visualText.shaped, black, style, tracking);
 }
 
@@ -744,30 +784,9 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const Lai
 void GfxRenderer::drawVisualText(const int fontId, const int resolvedFontId, const int x, const int y,
                                  const char* renderedText, const bool shapedText, const bool black,
                                  const EpdFontFamily::Style style, const int8_t tracking) const {
-  // Baseline from the resolved font; when the string was redirected to the
-  // fallback, the caller positioned this line with the REQUESTED font's
-  // metrics (row bands, icon centering), so center the fallback's line box
-  // inside the requested font's line box instead of letting a taller/shorter
-  // fallback hang below or float above the row's visual center.
-  int yPos = y + getFontAscenderSize(resolvedFontId);
-  if (resolvedFontId != fontId) {
-    yPos += (getLineHeight(fontId) - getLineHeight(resolvedFontId)) / 2;
-  }
-  int lastBaseX = x;
-  int lastBaseLeft = 0;
-  int lastBaseWidth = 0;
-  int lastBaseTop = 0;
-  int32_t prevAdvanceFP = 0;  // 12.4 fixed-point: prev glyph's advance + next kern for snap
-
   if (fontCacheManager_ && fontCacheManager_->isScanning()) {
     fontCacheManager_->recordText(renderedText, resolvedFontId, style);
     return;
-  }
-
-  // Redirected to the SD fallback: batch-load the string's glyphs so the draw
-  // loop below doesn't fault them in one SD read at a time (#2725).
-  if (resolvedFontId != fontId) {
-    ensureSdGlyphsResident(resolvedFontId, renderedText, style, false);
   }
 
   const auto fontIt = fontMap.find(resolvedFontId);
@@ -776,6 +795,38 @@ void GfxRenderer::drawVisualText(const int fontId, const int resolvedFontId, con
     return;
   }
   const auto& font = fontIt->second;
+  const EpdFontData* const regularFontData = font.getData(EpdFontFamily::REGULAR);
+  const int lineH = regularFontData ? static_cast<int>(regularFontData->advanceY) : 32;
+
+  // Baseline from REGULAR so BOLD/ITALIC runs stay locked to one line baseline;
+  // when redirected to the fallback, center the fallback's line box inside the
+  // requested font's line box so it aligns with surrounding UI chrome.
+  int yPos = y + (regularFontData ? static_cast<int>(regularFontData->ascender) : getFontAscenderSize(resolvedFontId));
+  if (resolvedFontId != fontId) {
+    yPos += (getLineHeight(fontId) - lineH) / 2;
+  }
+
+  // Strip-band word culling: skip SD prewarm scans and per-glyph binary searches
+  // when the word's conservative logical bbox misses the active strip.
+  if (_stripActive) {
+    const size_t rLen = std::strlen(renderedText);
+    const int maxCharAdv = lineH + (lineH >> 1) + (tracking > 0 ? tracking : 0);
+    const int maxSpan = static_cast<int>(rLen) * maxCharAdv + 24;
+    if (!glyphIntersectsStrip(x - 24, yPos - lineH - 24, x + maxSpan, yPos + lineH + 24)) {
+      return;
+    }
+  }
+  int lastBaseX = x;
+  int lastBaseLeft = 0;
+  int lastBaseWidth = 0;
+  int lastBaseTop = 0;
+  int32_t prevAdvanceFP = 0;  // 12.4 fixed-point: prev glyph's advance + next kern for snap
+
+  // Redirected to the SD fallback: batch-load the string's glyphs so the draw
+  // loop below doesn't fault them in one SD read at a time (#2725).
+  if (resolvedFontId != fontId) {
+    ensureSdGlyphsResident(resolvedFontId, renderedText, style, false);
+  }
 
   const char* textCursor = renderedText;
   uint32_t cp;
@@ -1276,7 +1327,15 @@ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const 
       const uint8_t whiteMask = static_cast<uint8_t>(~blackMask);
 
       uint8_t* row = target + static_cast<int32_t>(py - originY) * panelStride;
-      switch (mode) {
+#if CROSSPOINT_SUPPORT_GRAY16
+      const DitherMode effectiveMode = (renderMode == GRAY16_COARSE_LSB || renderMode == GRAY16_COARSE_MSB ||
+                                        renderMode == GRAY16_FINE_LSB || renderMode == GRAY16_FINE_MSB)
+                                           ? DitherMode::PreserveInk
+                                           : mode;
+#else
+      const DitherMode effectiveMode = mode;
+#endif
+      switch (effectiveMode) {
         case DitherMode::PreserveInk:
           for (int byte = byteStart; byte <= byteEnd; ++byte) {
             uint8_t mask = blackMask;
@@ -1312,7 +1371,7 @@ template void GfxRenderer::fillRectImpl<Color::DarkGray>(int, int, int, int, Dit
 
 void GfxRenderer::maskRoundedRectOutsideCorners(const int x, const int y, const int width, const int height,
                                                 const int radius, const Color color) const {
-  if (radius <= 0 || color == Color::Clear) {
+  if (radius <= 0 || color == Color::Clear || (color == Color::White && isOverlayGrayPlane())) {
     return;
   }
 
@@ -1599,11 +1658,29 @@ bool GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
       const uint8_t val = outputRow[bmpX / 4] >> (6 - ((bmpX * 2) % 8)) & 0x3;
       if (whiteAsTransparent && val == 3) continue;
 
-      if (renderMode == BW && val < 3) {
+      if (renderMode == BW &&
+          (isGray16Base() ? freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskBwClear, val) : (val < 3))) {
         drawPixel(screenX, screenY);
       } else if (renderMode == GRAYSCALE_LSB || renderMode == GRAYSCALE_MSB) {
         const auto pixel = grayPlanePixel(val, renderMode == GRAYSCALE_MSB, absoluteGrayPlanes);
         if (pixel.write) drawPixel(screenX, screenY, pixel.black);
+#if CROSSPOINT_SUPPORT_GRAY16
+      } else if (renderMode == GRAY16_COARSE_LSB &&
+                 freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskPass1Dtm1, val)) {
+        drawPixel(screenX, screenY, false);
+      } else if (renderMode == GRAY16_COARSE_MSB &&
+                 freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskPass1Dtm2, val)) {
+        drawPixel(screenX, screenY, false);
+      } else if (renderMode == GRAY16_FINE_LSB &&
+                 freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskPass2Dtm1, val)) {
+        drawPixel(screenX, screenY, false);
+      } else if (renderMode == GRAY16_FINE_MSB &&
+                 freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskPass2Dtm2, val)) {
+        drawPixel(screenX, screenY, false);
+      } else if (renderMode == GRAY16_CLEANUP_DTM1 &&
+                 freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskCleanupBlack, val)) {
+        drawPixel(screenX, screenY, true);
+#endif
       }
     }
   }
@@ -1844,14 +1921,29 @@ HalDisplay::RefreshMode GfxRenderer::applyPromotedRefresh(const HalDisplay::Refr
   return promotedRefresh_;
 }
 
-void GfxRenderer::displayBuffer(HalDisplay::RefreshMode refreshMode) const {
+void GfxRenderer::displayBuffer(HalDisplay::RefreshMode refreshMode, const bool keepPowered) const {
   auto elapsed = millis() - start_ms;
   LOG_DBG("GFX", "Time = %lu ms from clearScreen to displayBuffer", elapsed);
+  markGray16BaselineDirty();
   refreshMode = applyPromotedRefresh(refreshMode);
-  display.displayBuffer(refreshMode, fadingFix);
+  display.displayBuffer(refreshMode, !keepPowered && fadingFix);
+}
+
+void GfxRenderer::displayWindow(const int x, const int y, const int width, const int height) const {
+  // Only X3 UC8253 supports zero-heap hardware PTL windowed updates; other drivers
+  // (e.g. SSD1677) allocate a full-frame heap vector and skip AA/initial-full state.
+  if (!supportsGray16Planes() || promotedRefreshPending_ || fadingFix) {
+    displayBuffer(HalDisplay::FAST_REFRESH);
+    return;
+  }
+  const AlignedMemRect mem = screenRectToAlignedMemRect(orientation, x, y, width, height, panelWidth, panelHeight);
+  if (!mem.valid) return;
+  markGray16BaselineDirty();
+  display.displayWindow(mem.x, mem.y, mem.w, mem.h, /*turnOffScreen=*/false);
 }
 
 void GfxRenderer::displayBufferAsync(HalDisplay::RefreshMode refreshMode) const {
+  markGray16BaselineDirty();
   refreshMode = applyPromotedRefresh(refreshMode);
   // The async path has no turn-off-screen hook, which the sunlight fading fix
   // relies on; keep those users on the blocking path.
@@ -1863,6 +1955,10 @@ void GfxRenderer::displayBufferAsync(HalDisplay::RefreshMode refreshMode) const 
 }
 
 void GfxRenderer::waitRefreshComplete() const { display.waitRefreshComplete(); }
+
+#if CROSSPOINT_SUPPORT_GRAY16
+bool GfxRenderer::prewarmPowerOn() const { return display.prewarmPowerOn(); }
+#endif
 
 bool GfxRenderer::supportsAsyncRefresh() const { return !fadingFix && display.supportsAsyncRefresh(); }
 
@@ -2472,6 +2568,15 @@ int GfxRenderer::getTextHeight(const int fontId) const {
   return fontIt->second.getData(EpdFontFamily::REGULAR)->ascender;
 }
 
+bool GfxRenderer::textUsesMultiBitFont(const int fontId, const char* text, const EpdFontFamily::Style style) const {
+  if (text == nullptr || *text == '\0') return false;
+  const int resolvedFontId = resolveTextFontId(fontId, text, style);
+  const auto fontIt = fontMap.find(resolvedFontId);
+  if (fontIt == fontMap.end()) return false;
+  const EpdFontData* data = fontIt->second.getData(style);
+  return data != nullptr && (data->is2Bit || data->is4Bit);
+}
+
 void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y, const char* text, const bool black,
                                       const EpdFontFamily::Style style) const {
   // Cannot draw a NULL / empty string
@@ -2565,15 +2670,41 @@ size_t GfxRenderer::getBufferSize() const { return frameBufferSize; }
 // unused
 // void GfxRenderer::grayscaleRevert() const { display.grayscaleRevert(); }
 
-void GfxRenderer::displayGrayscaleBase(HalDisplay::RefreshMode fallback) const {
+void GfxRenderer::displayGrayscaleBase(HalDisplay::RefreshMode fallback, const bool keepPowered) const {
+  if (isGray16Base()) {
+    displayGray16Base(fallback, keepPowered);
+    return;
+  }
+  markGray16BaselineDirty();
   absoluteGrayPlanes = false;
-  display.displayGrayscaleBase(applyPromotedRefresh(fallback), fadingFix);
+  display.displayGrayscaleBase(applyPromotedRefresh(fallback), !keepPowered && fadingFix);
 }
 
-bool GfxRenderer::displayGrayscaleBase(HalDisplay::GrayscaleMode mode, HalDisplay::RefreshMode fallback) const {
+bool GfxRenderer::supportsDeferredGrayscaleBase() const {
+  return isGray16Base() ? supportsDeferredGray16Base() : display.supportsDeferredGrayscaleBase();
+}
+
+bool GfxRenderer::displayGrayscaleBaseAsync(HalDisplay::RefreshMode fallback, const bool keepPowered) const {
+  if (isGray16Base()) {
+    return displayGray16BaseAsync(fallback, keepPowered);
+  }
+  markGray16BaselineDirty();
   absoluteGrayPlanes = false;
-  if (!display.displayGrayscaleBase(mode, promotedRefreshPending_ ? promotedRefresh_ : fallback, fadingFix))
+  fallback = applyPromotedRefresh(fallback);
+  if (!keepPowered && fadingFix) {
+    display.displayGrayscaleBase(fallback, true);
     return false;
+  }
+  return display.displayGrayscaleBaseAsync(fallback);
+}
+
+bool GfxRenderer::displayGrayscaleBase(HalDisplay::GrayscaleMode mode, HalDisplay::RefreshMode fallback,
+                                       const bool keepPowered) const {
+  absoluteGrayPlanes = false;
+  if (!display.displayGrayscaleBase(mode, promotedRefreshPending_ ? promotedRefresh_ : fallback,
+                                    !keepPowered && fadingFix))
+    return false;
+  markGray16BaselineDirty();
   promotedRefreshPending_ = false;
   absoluteGrayPlanes = mode != HalDisplay::GrayscaleMode::Overlay;
   return true;
@@ -2601,6 +2732,53 @@ void GfxRenderer::displayGrayBuffer() const {
   absoluteGrayPlanes = false;
 }
 
+#if CROSSPOINT_SUPPORT_GRAY16
+bool GfxRenderer::supportsGray16Planes() const { return display.supportsGray16Planes(); }
+
+bool GfxRenderer::supportsDeferredGray16Base() const { return display.supportsDeferredGray16Base(); }
+
+void GfxRenderer::displayGray16Base(HalDisplay::RefreshMode fallback, const bool keepPowered) const {
+  gray16CleanOnGlass_ = false;
+  absoluteGrayPlanes = false;
+  display.displayGray16Base(applyPromotedRefresh(fallback), !keepPowered && fadingFix);
+}
+
+bool GfxRenderer::displayGray16BaseAsync(HalDisplay::RefreshMode fallback, const bool keepPowered) const {
+  gray16CleanOnGlass_ = false;
+  absoluteGrayPlanes = false;
+  fallback = applyPromotedRefresh(fallback);
+  if (!keepPowered && fadingFix) {
+    display.displayGray16Base(fallback, true);
+    return false;
+  }
+  return display.displayGray16BaseAsync(fallback);
+}
+
+void GfxRenderer::displayGray16Pass1() const { display.displayGray16Pass1(); }
+
+bool GfxRenderer::displayGray16Pass1Async() const { return display.displayGray16Pass1Async(); }
+
+void GfxRenderer::displayGray16Pass2() const { display.displayGray16Pass2(false); }
+
+bool GfxRenderer::displayGray16Pass2Async() const { return display.displayGray16Pass2Async(false); }
+
+void GfxRenderer::beginGray16Cleanup(const bool uploadFrameBuffer) const {
+  display.beginGray16Cleanup(uploadFrameBuffer ? frameBuffer : nullptr);
+}
+
+void GfxRenderer::finishGray16Cleanup() const {
+  display.finishGray16Cleanup();
+  gray16CleanOnGlass_ = true;
+  gray16BaselineDirty_ = false;
+}
+
+bool GfxRenderer::consumeDirtyGray16Baseline() const {
+  if (!gray16BaselineDirty_) return false;
+  gray16BaselineDirty_ = false;
+  return true;
+}
+#endif
+
 void GfxRenderer::setRenderMode(RenderMode mode) {
   if (mode == BW && absoluteGrayPlanes) {
     display.cleanupGrayscaleBuffers(nullptr);  // cancel an unfinished absolute pass
@@ -2613,6 +2791,11 @@ void GfxRenderer::writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* scratch
   // Guard the uint16_t casts below: a negative would wrap to a huge length.
   assert(yStart >= 0 && numRows > 0 && yStart <= static_cast<int>(panelHeight) - numRows);
   display.writeGrayscalePlaneStrip(lsbPlane, scratch, static_cast<uint16_t>(yStart), static_cast<uint16_t>(numRows));
+}
+
+bool GfxRenderer::writeGrayscalePlaneGateStream(bool lsbPlane, void* ctx,
+                                                size_t (*nextChunk)(void* ctx, const uint8_t** outChunk)) const {
+  return display.writeGrayscalePlaneGateStream(lsbPlane, ctx, nextChunk);
 }
 
 void GfxRenderer::freeBwBufferChunks() {

@@ -2,6 +2,7 @@
 
 #include <BitmapHelpers.h>
 #include <GfxRenderer.h>
+#include <GrayscaleCapabilities.h>
 #include <HalDisplay.h>
 #include <stdint.h>
 
@@ -19,6 +20,9 @@ struct DirectPixelWriter {
   uint8_t* fb;
   GfxRenderer::RenderMode mode;
   bool absolute = false;
+#if CROSSPOINT_SUPPORT_GRAY16
+  bool gray16Base = false;
+#endif
   bool ditherBw = false;       // images on a B/W-only page: dither in BW, skip the gray planes
   uint16_t displayWidthBytes;  // Runtime framebuffer stride (X4: 100, X3: 99)
   // Active write target: for tiled grayscale, fb is the band scratch, originY is
@@ -45,6 +49,9 @@ struct DirectPixelWriter {
     clipRows = renderer.getWriteRows();
     mode = renderer.getRenderMode();
     absolute = renderer.grayPlanesAreAbsolute();
+#if CROSSPOINT_SUPPORT_GRAY16
+    gray16Base = renderer.isGray16Base();
+#endif
     ditherBw = renderer.imagesDitheredInBw();
     displayWidthBytes = renderer.getDisplayWidthBytes();
 
@@ -163,7 +170,12 @@ struct DirectPixelWriter {
           const uint8_t threshold = BAYER[((rowLogicalY & 1) << 1) | (logicalX & 1)];
           state = pixelValue == 0 || (pixelValue == 1 && threshold < 3) || (pixelValue == 2 && threshold < 1);
         } else {
-          state = pixelValue < 3;
+#if CROSSPOINT_SUPPORT_GRAY16
+          state = gray16Base ? freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskBwClear, pixelValue)
+                             : (pixelValue < 3);
+#else
+          state = (pixelValue < 3);
+#endif
         }
         draw = writeWhiteInBw || state;
         break;
@@ -175,6 +187,39 @@ struct DirectPixelWriter {
         state = pixel.black;
         break;
       }
+#if CROSSPOINT_SUPPORT_GRAY16
+      case GfxRenderer::GRAY16_COARSE_LSB:
+        if (ditherBw || !freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskPass1Dtm1, pixelValue)) return;
+        draw = true;
+        state = false;
+        break;
+      case GfxRenderer::GRAY16_COARSE_MSB:
+        if (ditherBw || !freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskPass1Dtm2, pixelValue)) return;
+        draw = true;
+        state = false;
+        break;
+      case GfxRenderer::GRAY16_FINE_LSB:
+        if (ditherBw || !freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskPass2Dtm1, pixelValue)) return;
+        draw = true;
+        state = false;
+        break;
+      case GfxRenderer::GRAY16_FINE_MSB:
+        if (ditherBw || !freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskPass2Dtm2, pixelValue)) return;
+        draw = true;
+        state = false;
+        break;
+      case GfxRenderer::GRAY16_CLEANUP_DTM1:
+        if (ditherBw) {
+          static constexpr uint8_t BAYER[4] = {0, 2, 3, 1};
+          const uint8_t threshold = BAYER[((rowLogicalY & 1) << 1) | (logicalX & 1)];
+          state = pixelValue == 0 || (pixelValue == 1 && threshold < 3) || (pixelValue == 2 && threshold < 1);
+          draw = state;
+        } else {
+          draw = freeink::gray16::maskHasImage2Bit(freeink::gray16::kMaskCleanupBlack, pixelValue);
+          state = true;
+        }
+        break;
+#endif
       default:
         return;
     }

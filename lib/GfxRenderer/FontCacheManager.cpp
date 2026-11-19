@@ -30,7 +30,10 @@ void FontCacheManager::clearCache() {
 }
 
 void FontCacheManager::releaseSdFontCaches() {
+  bumpPrewarmGeneration();
   lastScanFontCount_ = 0;
+  lastScanUsedNonSdCache_ = false;
+  lastScanOverflowed_ = false;
   memset(scanStyleMasks_, 0, sizeof(scanStyleMasks_));
   memset(lastScanStyleMasks_, 0, sizeof(lastScanStyleMasks_));
   if (releaseCb_) releaseCb_(releaseCtx_);
@@ -46,6 +49,9 @@ void FontCacheManager::releaseSdFontCaches() {
 }
 
 bool FontCacheManager::prewarmCache(int fontId, const char* utf8Text, uint8_t styleMask, bool accumulate) {
+  if (!inScopePrewarm_) {
+    bumpPrewarmGeneration();
+  }
   // TTF (vector) font prewarm path. This is the single dispatch every draw path
   // funnels through (reader endScanAndPrewarm, the settings preview, UI text),
   // so building here covers them all. For TTF, build() maintains an accumulating
@@ -95,15 +101,34 @@ void FontCacheManager::compactAfterPrewarm(const bool dropLayoutAdvanceCache) {
   for (auto& [id, font] : sdCardFonts_) {
     if (!font) continue;
     uint8_t activeMask = 0;
+    int matchedSlot = -1;
     for (uint8_t slot = 0; slot < lastScanFontCount_; ++slot) {
       if (lastScanFontIds_[slot] == id) {
         activeMask = lastScanStyleMasks_[slot];
+        matchedSlot = static_cast<int>(slot);
         break;
       }
     }
     activeMask |= font->scannedStyleMask();
     font->compactForRender(activeMask, dropLayoutAdvanceCache);
+    if (matchedSlot >= 0) {
+      lastScanSdGenerations_[matchedSlot] = font->residentGeneration();
+    }
   }
+}
+
+bool FontCacheManager::canReuseLastPrewarmWithoutScope(const uint32_t expectedGen) const {
+  if (expectedGen == 0 || prewarmGeneration_ != expectedGen || lastScanUsedNonSdCache_ || lastScanOverflowed_) {
+    return false;
+  }
+  for (uint8_t slot = 0; slot < lastScanFontCount_; ++slot) {
+    const auto it = sdCardFonts_.find(lastScanFontIds_[slot]);
+    if (it == sdCardFonts_.end()) continue;  // Uncompressed static flash font (e.g. SMALL_FONT_ID)
+    if (!it->second) return false;
+    if (it->second->residentGeneration() != lastScanSdGenerations_[slot]) return false;
+    if (!it->second->areStylesRenderResident(lastScanStyleMasks_[slot])) return false;
+  }
+  return true;
 }
 
 int FontCacheManager::getIdleLookaheadPages(const int fontId) const {
@@ -157,7 +182,10 @@ void FontCacheManager::recordText(const char* text, int fontId, EpdFontFamily::S
     }
   }
   if (fontSlot == scanFontCount_) {
-    if (scanFontCount_ >= MAX_SCAN_FONTS) return;
+    if (scanFontCount_ >= MAX_SCAN_FONTS) {
+      scanOverflowed_ = true;
+      return;
+    }
     scanFontIds_[scanFontCount_++] = fontId;
   }
 
@@ -184,6 +212,7 @@ void FontCacheManager::recordText(const char* text, int fontId, EpdFontFamily::S
     if (found) continue;
 
     if (scanCodepointCount_ >= MAX_SCAN_CODEPOINTS) {
+      scanOverflowed_ = true;
       if (!scanOverflowWarned_) {
         LOG_DBG("FCM", "Scan codepoint cap (%u) reached; excess glyphs will load on demand",
                 static_cast<unsigned>(MAX_SCAN_CODEPOINTS));
@@ -213,6 +242,7 @@ FontCacheManager::PrewarmScope::PrewarmScope(FontCacheManager& manager, const bo
   manager_->scanCodepointCount_ = 0;
   manager_->scanFontCount_ = 0;
   manager_->scanOverflowWarned_ = false;
+  manager_->scanOverflowed_ = false;
   memset(manager_->scanGroupCounts_, 0, sizeof(manager_->scanGroupCounts_));
   memset(manager_->scanStyleMasks_, 0, sizeof(manager_->scanStyleMasks_));
 }
@@ -220,13 +250,21 @@ FontCacheManager::PrewarmScope::PrewarmScope(FontCacheManager& manager, const bo
 bool FontCacheManager::PrewarmScope::endScanAndPrewarm() {
   if (manager_->scanMode_ != ScanMode::Scanning) return true;
   manager_->scanMode_ = ScanMode::None;
+  manager_->bumpPrewarmGeneration();
 
   // Record per-font style masks for compactAfterPrewarm(), including styles
-  // observed past MAX_SCAN_CODEPOINTS.
+  // observed past MAX_SCAN_CODEPOINTS, and whether any compressed/TTF non-SD font was scanned.
   if (!accumulate_) {
     manager_->lastScanFontCount_ = 0;
+    manager_->lastScanUsedNonSdCache_ = false;
+    manager_->lastScanOverflowed_ = manager_->scanOverflowed_;
     memset(manager_->lastScanStyleMasks_, 0, sizeof(manager_->lastScanStyleMasks_));
+    memset(manager_->lastScanSdGenerations_, 0, sizeof(manager_->lastScanSdGenerations_));
+  } else {
+    manager_->lastScanOverflowed_ = manager_->lastScanOverflowed_ || manager_->scanOverflowed_;
   }
+  manager_->scanOverflowed_ = false;
+
   for (uint8_t slot = 0; slot < manager_->scanFontCount_; ++slot) {
     const int id = manager_->scanFontIds_[slot];
     const uint8_t mask = manager_->scanStyleMasks_[slot];
@@ -238,14 +276,44 @@ bool FontCacheManager::PrewarmScope::endScanAndPrewarm() {
         break;
       }
     }
-    if (!merged && manager_->lastScanFontCount_ < MAX_SCAN_FONTS) {
-      const uint8_t dst = manager_->lastScanFontCount_++;
-      manager_->lastScanFontIds_[dst] = id;
-      manager_->lastScanStyleMasks_[dst] = mask;
+    if (!merged) {
+      if (manager_->lastScanFontCount_ < MAX_SCAN_FONTS) {
+        const uint8_t dst = manager_->lastScanFontCount_++;
+        manager_->lastScanFontIds_[dst] = id;
+        manager_->lastScanStyleMasks_[dst] = mask;
+        manager_->lastScanSdGenerations_[dst] = 0;
+      } else {
+        manager_->lastScanOverflowed_ = true;
+      }
+    }
+#if CROSSPOINT_VECTOR_FONTS
+    if (manager_->ttfFonts_.find(id) != manager_->ttfFonts_.end()) {
+      manager_->lastScanUsedNonSdCache_ = true;
+      continue;
+    }
+#endif
+    if (manager_->sdCardFonts_.find(id) == manager_->sdCardFonts_.end()) {
+      const auto fmIt = manager_->fontMap_.find(id);
+      if (fmIt != manager_->fontMap_.end() && manager_->fontDecompressor_) {
+        for (uint8_t st = 0; st < 4; ++st) {
+          if (!(mask & (1u << st))) continue;
+          const EpdFontData* data = fmIt->second.getData(static_cast<EpdFontFamily::Style>(st));
+          if (data && data->groups != nullptr) {
+            manager_->lastScanUsedNonSdCache_ = true;
+            break;
+          }
+        }
+      }
     }
   }
 
   if (manager_->scanCodepointCount_ == 0) {
+    for (uint8_t slot = 0; slot < manager_->lastScanFontCount_; ++slot) {
+      const auto sdIt = manager_->sdCardFonts_.find(manager_->lastScanFontIds_[slot]);
+      if (sdIt != manager_->sdCardFonts_.end() && sdIt->second) {
+        manager_->lastScanSdGenerations_[slot] = sdIt->second->residentGeneration();
+      }
+    }
     manager_->scanFontCount_ = 0;
     memset(manager_->scanGroupCounts_, 0, sizeof(manager_->scanGroupCounts_));
     memset(manager_->scanStyleMasks_, 0, sizeof(manager_->scanStyleMasks_));
@@ -281,6 +349,7 @@ bool FontCacheManager::PrewarmScope::endScanAndPrewarm() {
   // claims resident slabs before Bold/Italic/BoldItalic. Save and restore the
   // boundary byte in case a group of 4-byte codepoints fills its entire slice.
   bool ok = true;
+  manager_->inScopePrewarm_ = true;
   for (uint8_t group = 0; group < SCAN_GROUP_COUNT; group++) {
     if (manager_->scanGroupCounts_[group] == 0) continue;
 
@@ -294,6 +363,14 @@ bool FontCacheManager::PrewarmScope::endScanAndPrewarm() {
     const bool stepOk = manager_->prewarmCache(manager_->scanFontIds_[fontSlot], utf8Text, 1 << style, accumulate_);
     ok = ok && stepOk;
     utf8Text[utf8Len] = savedByte;
+  }
+  manager_->inScopePrewarm_ = false;
+
+  for (uint8_t slot = 0; slot < manager_->lastScanFontCount_; ++slot) {
+    const auto sdIt = manager_->sdCardFonts_.find(manager_->lastScanFontIds_[slot]);
+    if (sdIt != manager_->sdCardFonts_.end() && sdIt->second) {
+      manager_->lastScanSdGenerations_[slot] = sdIt->second->residentGeneration();
+    }
   }
 
   manager_->scanCodepointCount_ = 0;

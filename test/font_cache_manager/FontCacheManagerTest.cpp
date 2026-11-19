@@ -311,3 +311,96 @@ TEST(FontCacheManagerTest, ShapedTokensSkipPositionTokensAndPreserveScannedStyle
   EXPECT_STREQ(expectedGlyphOnly.c_str(), indicFont.prewarmCalls[0].text);
   EXPECT_EQ(0x02u, indicFont.lastCompactStyleMask);
 }
+
+TEST(FontCacheManagerTest, SpeculativeResidencyReuseTracksGenerationAndRejectsCompressedBuiltins) {
+  SdCardFont bodyFont;
+  EpdFontData uncompressedUiData{nullptr};
+  const EpdFontFamily uiFamily(&uncompressedUiData, nullptr, nullptr, nullptr);
+  const std::map<int, EpdFontFamily> builtinFonts{{11, uiFamily}};
+  const std::map<int, SdCardFont*> sdFonts{{-17, &bodyFont}};
+  FontDecompressor decompressor;
+  FontCacheManager manager(builtinFonts, sdFonts, kNoTtfFonts);
+  manager.setFontDecompressor(&decompressor);
+
+  uint32_t gen = 0;
+  {
+    auto scope = manager.createPrewarmScope();
+    manager.recordText("Hello", -17, EpdFontFamily::REGULAR);
+    manager.recordText("12/124", 11, EpdFontFamily::REGULAR);
+    EXPECT_TRUE(scope.endScanAndPrewarm());
+    manager.compactAfterPrewarm(/*dropLayoutAdvanceCache=*/true);
+    gen = manager.prewarmGeneration();
+  }
+  EXPECT_TRUE(manager.canReuseLastPrewarmWithoutScope(gen));
+
+  // Direct SdCardFont slab eviction invalidates reuse immediately.
+  bodyFont.residentGen++;
+  EXPECT_FALSE(manager.canReuseLastPrewarmWithoutScope(gen));
+  bodyFont.residentGen--;
+  EXPECT_TRUE(manager.canReuseLastPrewarmWithoutScope(gen));
+
+  // Compressed built-in font (groups != nullptr) requires FontDecompressor pageSlots -> cannot skip PrewarmScope.
+  EpdFontData compressedData{reinterpret_cast<const void*>(1)};
+  const EpdFontFamily compressedFamily(&compressedData, nullptr, nullptr, nullptr);
+  const std::map<int, EpdFontFamily> compressedBuiltins{{5, compressedFamily}};
+  FontCacheManager compressedMgr(compressedBuiltins, sdFonts, kNoTtfFonts);
+  compressedMgr.setFontDecompressor(&decompressor);
+  uint32_t compGen = 0;
+  {
+    auto scope = compressedMgr.createPrewarmScope();
+    compressedMgr.recordText("Hello", 5, EpdFontFamily::REGULAR);
+    EXPECT_TRUE(scope.endScanAndPrewarm());
+    compGen = compressedMgr.prewarmGeneration();
+  }
+  EXPECT_FALSE(compressedMgr.canReuseLastPrewarmWithoutScope(compGen));
+}
+
+TEST(FontCacheManagerTest, ScanOverflowRejectsSpeculativeReuseAndRecoversOnNextCleanScan) {
+  SdCardFont f0, f1, f2, f3, f4;
+  const std::map<int, EpdFontFamily> noBuiltinFonts;
+  const std::map<int, SdCardFont*> sdFonts{{-10, &f0}, {-11, &f1}, {-12, &f2}, {-13, &f3}, {-14, &f4}};
+  FontCacheManager manager(noBuiltinFonts, sdFonts, kNoTtfFonts);
+
+  // 1. Exceed MAX_SCAN_CODEPOINTS (512) on one SD font -> canReuseLastPrewarmWithoutScope must return false.
+  std::string denseUtf8;
+  denseUtf8.reserve(520 * 3);
+  for (uint32_t cp = 0x0100; cp < 0x0100 + 520; ++cp) {
+    denseUtf8.push_back(static_cast<char>(0xC0u | (cp >> 6)));
+    denseUtf8.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+  }
+  uint32_t overflowCpGen = 0;
+  {
+    auto scope = manager.createPrewarmScope();
+    manager.recordText(denseUtf8.c_str(), -10, EpdFontFamily::REGULAR);
+    EXPECT_TRUE(scope.endScanAndPrewarm());
+    manager.compactAfterPrewarm(/*dropLayoutAdvanceCache=*/true);
+    overflowCpGen = manager.prewarmGeneration();
+  }
+  EXPECT_FALSE(manager.canReuseLastPrewarmWithoutScope(overflowCpGen));
+
+  // 2. Subsequent within-cap scan clears lastScanOverflowed_ -> reuse allowed again.
+  uint32_t cleanGen = 0;
+  {
+    auto scope = manager.createPrewarmScope();
+    manager.recordText("CleanPage", -10, EpdFontFamily::REGULAR);
+    EXPECT_TRUE(scope.endScanAndPrewarm());
+    manager.compactAfterPrewarm(/*dropLayoutAdvanceCache=*/true);
+    cleanGen = manager.prewarmGeneration();
+  }
+  EXPECT_TRUE(manager.canReuseLastPrewarmWithoutScope(cleanGen));
+
+  // 3. Exceed MAX_SCAN_FONTS (4) across 5 distinct fonts -> canReuseLastPrewarmWithoutScope must return false.
+  uint32_t overflowFontGen = 0;
+  {
+    auto scope = manager.createPrewarmScope();
+    manager.recordText("a", -10, EpdFontFamily::REGULAR);
+    manager.recordText("b", -11, EpdFontFamily::REGULAR);
+    manager.recordText("c", -12, EpdFontFamily::REGULAR);
+    manager.recordText("d", -13, EpdFontFamily::REGULAR);
+    manager.recordText("e", -14, EpdFontFamily::REGULAR);
+    EXPECT_TRUE(scope.endScanAndPrewarm());
+    manager.compactAfterPrewarm(/*dropLayoutAdvanceCache=*/true);
+    overflowFontGen = manager.prewarmGeneration();
+  }
+  EXPECT_FALSE(manager.canReuseLastPrewarmWithoutScope(overflowFontGen));
+}

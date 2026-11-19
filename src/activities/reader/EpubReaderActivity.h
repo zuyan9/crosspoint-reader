@@ -4,8 +4,13 @@
 #include <Epub/FootnoteEntry.h>
 #include <Epub/PageLink.h>
 #include <Epub/Section.h>
+#include <HalDisplay.h>
+#if CROSSPOINT_SUPPORT_GRAY16
+#include <Gray16ZeroRle.h>
+#endif
 
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -37,6 +42,11 @@ class EpubReaderActivity final : public ReaderActivity {
   unsigned long pageTurnDuration = 0UL;
   int8_t pendingManualTurn = 0;
   bool pendingManualTurnTouch = false;
+  void clearPendingManualTurn() {
+    pendingManualTurn = 0;
+    pendingManualTurnTouch = false;
+  }
+  bool applyPageTurnLocked(bool isForwardTurn);
   bool pendingPercentJump = false;
   float pendingSpineProgress = 0.0f;
   bool pendingScreenshot = false;
@@ -57,6 +67,63 @@ class EpubReaderActivity final : public ReaderActivity {
   int idlePrewarmPage = -1;
   int idlePrewarmOffset = 0;
   unsigned long lastRenderCompleteMs = 0;
+  bool popupDirtiedScreen_ = false;
+
+  void computeReaderMargins(int& top, int& right, int& bottom, int& left) const;
+#if CROSSPOINT_SUPPORT_GRAY16
+  // Speculative RLE buffers use std::malloc/std::realloc (freed via std::free)
+  // so stageIdleNextPage() can shrink tempRle in place without splitting the heap.
+  struct FreeBytesDeleter {
+    void operator()(uint8_t* p) const noexcept { std::free(p); }
+  };
+  using SpecRlePtr = std::unique_ptr<uint8_t[], FreeBytesDeleter>;
+
+  // Idle speculative staging for Page N+1 (body + clipping highlights compressed
+  // via inverted Gray16ZeroRle, status bar omitted so live clock/battery ticks
+  // never invalidate the staged page; freed before 32 KB gray16RleBuf allocates).
+  struct SpeculativeNextPage {
+    std::unique_ptr<Page> page;
+    SpecRlePtr baseRle;
+    size_t baseRleBytes = 0;
+    Gray16ZeroRle::PlaneStripIndex baseRleIndex{};
+    uint32_t fontPrewarmGen = 0;
+    uint32_t renderSpecSig = 0;
+    int spineIndex = -1;
+    int pageIndex = -1;
+    int fontId = 0;
+    int marginTop = 0;
+    int marginRight = 0;
+    int marginBottom = 0;
+    int marginLeft = 0;
+    uint16_t panelWidthBytes = 0;
+    uint16_t panelHeight = 0;
+    size_t clippingCount = 0;
+    uint8_t orientation = 0;
+    uint8_t textAntiAliasing = 0;
+    uint8_t imageRendering = 0;
+    bool screenInverted = false;
+    void reset() {
+      baseRle.reset();
+      page.reset();
+      baseRleBytes = 0;
+      baseRleIndex = {};
+      fontPrewarmGen = 0;
+      spineIndex = -1;
+      pageIndex = -1;
+    }
+  };
+  SpeculativeNextPage specNextPage;
+  void clearSpeculativeNextPage() { specNextPage.reset(); }
+  bool canStageSpeculativeGray16(const Page& page) const;
+  void stageIdleNextPage();
+  std::unique_ptr<Page> takeSpeculativeNextPage(int spineIdx, int pageIdx, const ReaderRenderSpec& spec, int top,
+                                                int right, int bottom, int left, SpecRlePtr& outBaseRle,
+                                                size_t& outBaseRleBytes,
+                                                Gray16ZeroRle::PlaneStripIndex& outBaseRleIndex,
+                                                uint32_t& outFontPrewarmGen);
+#else
+  void clearSpeculativeNextPage() {}
+#endif
   bool bookmarkRemoved = false;
   std::vector<BookmarkEntry> cachedBookmarks;
   bool recentsEntryRemoved = false;
@@ -99,6 +166,7 @@ class EpubReaderActivity final : public ReaderActivity {
   // be running on the panel. settleOverlayRefresh() must run before the
   // framebuffer is touched or another differential refresh is pushed.
   bool overlayRefreshPending = false;
+  int16_t lastOverlayTopY = -1;
   void pushOverlayRefresh();
   void settleOverlayRefresh();
   int autoTurnOption = 0;  // current auto page-turn rate index (More panel)
@@ -222,8 +290,29 @@ class EpubReaderActivity final : public ReaderActivity {
   void navigateToHref(const std::string& href, bool savePosition = false);
   void restoreSavedPosition();
 
+  struct StatusBarSnapshot {
+    std::string title;
+    BaseTheme::StatusBarPinnedState pinned;
+    float bookProgress = 0.0f;
+    int currentPage = 1;
+    int pageCount = 1;
+    int textYOffset = 0;
+    bool bookmarked = false;
+    bool isBuilding = false;
+    bool titleUsesMultiBitFont = false;
+  };
+  mutable const StatusBarSnapshot* activeStatusBarSnapshot = nullptr;
+  StatusBarSnapshot buildStatusBarSnapshot(bool recordLinkNote = true, int pageOverride = -1) const;
+
+#if CROSSPOINT_SUPPORT_GRAY16
+  void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
+                      int orientedMarginBottom, int orientedMarginLeft, SpecRlePtr specBaseRle = nullptr,
+                      size_t specBaseRleBytes = 0, const Gray16ZeroRle::PlaneStripIndex* specBaseRleIndex = nullptr,
+                      uint32_t specFontPrewarmGen = 0);
+#else
   void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
+#endif
   void drawClippingHighlights(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft) const;
   void renderStatusBar() const;
   void applyOrientation(uint8_t orientation);
@@ -257,9 +346,12 @@ class EpubReaderActivity final : public ReaderActivity {
  public:
   explicit EpubReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string bookPath,
                               bool allowFastInitialRefresh)
-      : ReaderActivity("EpubReader", renderer, mappedInput, std::move(bookPath), allowFastInitialRefresh) {}
+      : ReaderActivity("EpubReader", renderer, mappedInput, std::move(bookPath), allowFastInitialRefresh),
+        popupDirtiedScreen_(!allowFastInitialRefresh) {}
   ~EpubReaderActivity() override;
 
+  void onExit() override;
+  void prepareForSleep() override;
   void loop() override;
   void render(RenderLock&& lock) override;
 

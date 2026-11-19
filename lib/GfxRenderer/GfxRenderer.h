@@ -34,7 +34,16 @@ enum Color : uint8_t { Clear = 0x00, White = 0x01, LightGray = 0x05, DarkGray = 
 
 class GfxRenderer {
  public:
-  enum RenderMode { BW, GRAYSCALE_LSB, GRAYSCALE_MSB };
+  enum RenderMode {
+    BW,
+    GRAYSCALE_LSB,
+    GRAYSCALE_MSB,
+    GRAY16_COARSE_LSB,
+    GRAY16_COARSE_MSB,
+    GRAY16_FINE_LSB,
+    GRAY16_FINE_MSB,
+    GRAY16_CLEANUP_DTM1
+  };
   enum class DitherMode { Replace, PreserveInk };
 
   // Logical screen orientation from the perspective of callers
@@ -51,6 +60,11 @@ class GfxRenderer {
   HalDisplay& display;
   RenderMode renderMode;
   mutable bool absoluteGrayPlanes = false;
+#if CROSSPOINT_SUPPORT_GRAY16
+  mutable bool gray16BaseActive_ = false;
+  mutable bool gray16CleanOnGlass_ = false;
+  mutable bool gray16BaselineDirty_ = false;
+#endif
   bool ditherImagesInBw = false;
   Orientation orientation;
   bool fadingFix;
@@ -82,6 +96,14 @@ class GfxRenderer {
   mutable HalDisplay::RefreshMode promotedRefresh_ = HalDisplay::FAST_REFRESH;
   // Swap in (and clear) the promoted mode, if one is pending.
   HalDisplay::RefreshMode applyPromotedRefresh(HalDisplay::RefreshMode refreshMode) const;
+  void markGray16BaselineDirty() const {
+#if CROSSPOINT_SUPPORT_GRAY16
+    if (gray16CleanOnGlass_) {
+      gray16CleanOnGlass_ = false;
+      gray16BaselineDirty_ = true;
+    }
+#endif
+  }
 
   // Tiled grayscale strip target. When active, drawPixel()/clearScreen()
   // operate on a caller-owned scratch holding one horizontal band of physical
@@ -220,7 +242,8 @@ class GfxRenderer {
   int getScreenWidth() const;
   int getScreenHeight() const;
   void tapToLogical(float nx, float ny, int& outX, int& outY) const;
-  void displayBuffer(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
+  void displayBuffer(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH, bool keepPowered = false) const;
+  void displayWindow(int x, int y, int width, int height) const;
   // One-shot: the next displayBuffer(), displayBufferAsync(), or
   // displayGrayscaleBase() call uses `mode`
   // instead of what its caller asked for, then the override clears itself.
@@ -238,6 +261,11 @@ class GfxRenderer {
   // support. See HalDisplay::displayBufferAsync for the baseline contract.
   void displayBufferAsync(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
   void waitRefreshComplete() const;
+#if CROSSPOINT_SUPPORT_GRAY16
+  bool prewarmPowerOn() const;
+#else
+  bool prewarmPowerOn() const { return false; }
+#endif
   // True when displayBufferAsync() genuinely overlaps: panel defers and
   // fadingFix isn't forcing the blocking path. Callers can skip overlap
   // scaffolding (e.g. whole-plane grayscale buffers) when false.
@@ -419,24 +447,74 @@ class GfxRenderer {
   void drawTextRotated90CW(int fontId, int x, int y, const char* text, bool black = true,
                            EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   int getTextHeight(int fontId) const;
+  bool textUsesMultiBitFont(int fontId, const char* text, EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
 
   // Grayscale functions
   void setRenderMode(RenderMode mode);
   RenderMode getRenderMode() const { return renderMode; }
+  // When true during RenderMode::BW, Split-Rail 16-gray base uses kMaskBwClear (0xFF00) so
+  // dark stems (ink 8..15) start on the black rail while light outer AA (ink 1..7) stays on
+  // the white rail; when false (4-gray or plain B/W), Plane::BW uses kMask4BitBw (0xFFFC).
+#if CROSSPOINT_SUPPORT_GRAY16
+  void setGray16Base(bool enabled) const { gray16BaseActive_ = enabled; }
+  bool isGray16Base() const { return gray16BaseActive_; }
+#else
+  void setGray16Base(bool) const {}
+  bool isGray16Base() const { return false; }
+#endif
   // Settle the full frame after displaying the B/W base and before writing
   // the grayscale planes (no-op on X4).
   void preconditionGrayscale() const;
   // Display the framebuffer as the base frame for a grayscale overlay that
   // follows (X3: OEM differential base waveform; others: plain display with
   // `fallback`).
-  void displayGrayscaleBase(HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH) const;
-  bool displayGrayscaleBase(HalDisplay::GrayscaleMode mode,
-                            HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH) const;
+  void displayGrayscaleBase(HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH,
+                            bool keepPowered = false) const;
+  bool displayGrayscaleBase(HalDisplay::GrayscaleMode mode, HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH,
+                            bool keepPowered = false) const;
+  bool supportsDeferredGrayscaleBase() const;
+  bool displayGrayscaleBaseAsync(HalDisplay::RefreshMode fallback = HalDisplay::FAST_REFRESH,
+                                 bool keepPowered = false) const;
   void copyGrayscaleLsbBuffers() const;
   void copyGrayscaleMsbBuffers() const;
   void displayGrayBuffer() const;
+#if CROSSPOINT_SUPPORT_GRAY16
+  bool supportsGray16Planes() const;
+  bool supportsDeferredGray16Base() const;
+  void displayGray16Base(HalDisplay::RefreshMode fallback = HalDisplay::FAST_REFRESH, bool keepPowered = false) const;
+  bool displayGray16BaseAsync(HalDisplay::RefreshMode fallback = HalDisplay::FAST_REFRESH,
+                              bool keepPowered = false) const;
+  void displayGray16Pass1() const;
+  bool displayGray16Pass1Async() const;
+  void displayGray16Pass2() const;
+  bool displayGray16Pass2Async() const;
+  void beginGray16Cleanup(bool uploadFrameBuffer = true) const;
+  void finishGray16Cleanup() const;
+  bool consumeDirtyGray16Baseline() const;
+#else
+  bool supportsGray16Planes() const { return false; }
+  bool supportsDeferredGray16Base() const { return false; }
+  void displayGray16Base(HalDisplay::RefreshMode = HalDisplay::FAST_REFRESH, bool = false) const {}
+  bool displayGray16BaseAsync(HalDisplay::RefreshMode = HalDisplay::FAST_REFRESH, bool = false) const { return false; }
+  void displayGray16Pass1() const {}
+  bool displayGray16Pass1Async() const { return false; }
+  void displayGray16Pass2() const {}
+  bool displayGray16Pass2Async() const { return false; }
+  void beginGray16Cleanup(bool = true) const {}
+  void finishGray16Cleanup() const {}
+  bool consumeDirtyGray16Baseline() const { return false; }
+#endif
   // Active input encoding, used when drawing monochrome overlays into planes.
   bool grayPlanesAreAbsolute() const { return absoluteGrayPlanes; }
+  bool isOverlayGrayPlane() const {
+    if (absoluteGrayPlanes) return false;
+#if CROSSPOINT_SUPPORT_GRAY16
+    return renderMode == GRAYSCALE_LSB || renderMode == GRAYSCALE_MSB || renderMode == GRAY16_COARSE_LSB ||
+           renderMode == GRAY16_COARSE_MSB || renderMode == GRAY16_FINE_LSB || renderMode == GRAY16_FINE_MSB;
+#else
+    return renderMode == GRAYSCALE_LSB || renderMode == GRAYSCALE_MSB;
+#endif
+  }
   // B/W pass: draw 2-bit image pixels as a 2x2 ordered dither instead of
   // "any ink is black". Only for pages that get no image grayscale pass,
   // because overlay gray planes expect every gray pixel black in the base.
@@ -448,6 +526,8 @@ class GfxRenderer {
   // numRows)), bypassing the framebuffer. Check grayscaleCapabilities(mode).stripUploads
   // with the same grayscale mode used for the planes.
   void writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* scratch, int yStart, int numRows) const;
+  bool writeGrayscalePlaneGateStream(bool lsbPlane, void* ctx,
+                                     size_t (*nextChunk)(void* ctx, const uint8_t** outChunk)) const;
   bool storeBwBuffer();  // Returns true if buffer was stored successfully
   // Restore and free the stored buffer. resyncPanelBaseline rewrites the
   // controller's differential baseline to the restored frame — correct after

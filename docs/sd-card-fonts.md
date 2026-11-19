@@ -322,4 +322,6 @@ Pass `--4bit` (optionally with `--gamma`, `--stem-anchor`, and `--halo-clip`) to
 
 `build-sd-fonts.py --4bit` enables `--4bit --stem-anchor --halo-clip --gamma 1.10` across configured families automatically (with optional `--gamma`, `--stem-anchor`/`--no-stem-anchor`, `--halo-clip`/`--no-halo-clip`, `--families`, and `--sizes` overrides). Older firmware versions without 4-bit `.cpfont` support treat `flags = 0x0002` glyphs as corrupt, drawing blank text and reporting `"Damaged font file"`.
 
+**Xteink X3 (UC8253 panel)** runs a two-pass 16-gray refresh for built-in **Noto Sans**, 2-bit `.cpfont`, and 4-bit `.cpfont` reader fonts when **Text Anti-Aliasing** is enabled and **Night Mode** is off, while other grayscale panels (including UC8279 X3, X4, and external-RAM boards) render reader glyphs using single-pass 4-gray planes when supported in the active display mode. On Xteink X3 (`UC8253` panel) with **Text Anti-Aliasing** enabled (and **Night Mode** off), two-pass 16-gray text refreshes run a cleanup refresh at least every 15 pages even when **Refresh Frequency** is set to 30 pages or **Never**.
+
 Install custom fonts via the web interface or manual SD card copy.

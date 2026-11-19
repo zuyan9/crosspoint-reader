@@ -200,6 +200,7 @@ SdCardFont::~SdCardFont() { freeAll(); }
 // --- Per-style free/cleanup ---
 
 void SdCardFont::freeStyleMiniData(PerStyle& s) {
+  if (++residentGeneration_ == 0) residentGeneration_ = 1;
   psramDeleteArray(s.miniIntervals);
   s.miniIntervals = nullptr;
   psramDeleteArray(s.miniGlyphs);
@@ -1574,6 +1575,7 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
   s.miniKernRightClassCount = 0;
   memset(&s.miniData, 0, sizeof(s.miniData));
   s.epdFont.data = &s.stubData;
+  if (++residentGeneration_ == 0) residentGeneration_ = 1;
 
   if (!ensureArrayCapacity(s.miniIntervals, s.miniIntervalCapacity, validCount)) {
     LOG_ERR("SDCF", "Failed to allocate mini intervals for style %u", styleIdx);
@@ -1962,6 +1964,7 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
   s.miniData.shapeHandler = s.shaper ? &SdCardFont::onShape : nullptr;
 
   s.epdFont.data = &s.miniData;
+  if (++residentGeneration_ == 0) residentGeneration_ = 1;
 
   // Accumulate stats
   stats_.sdReadTimeMs += sdTime;
@@ -1985,6 +1988,24 @@ void SdCardFont::clearCache() {
     resetStyleMiniData(styleData(i));
     applyGlyphMissCallback(i);
   }
+}
+
+bool SdCardFont::areStylesRenderResident(uint8_t styleMask) const {
+  if (!loaded_) return false;
+  styleMask = resolveStyleMask(styleMask);
+  for (uint8_t si = 0; si < MAX_STYLES; ++si) {
+    if (!(styleMask & (1u << si)) || !hasStyle(si)) continue;
+    const auto& s = styleData(si);
+    if (s.epdFont.data != &s.miniData || s.miniMetadataOnly || s.miniGlyphCount == 0 || s.miniSpilledCount > 0) {
+      return false;
+    }
+    if (s.header.is4Bit) {
+      if (s.miniBitmapSlabsUsed == 0 || !s.miniBitmapSlabs[0]) return false;
+    } else if (!s.miniBitmap && s.miniBitmapUsed > 0) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void SdCardFont::compactForRender(uint8_t activeStyleMask, const bool dropLayoutAdvanceCache) {

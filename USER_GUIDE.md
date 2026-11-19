@@ -251,7 +251,7 @@ Settings are grouped into **System**, **Display**, **Reader**, **Controls**, **L
   - "In Reader" - Show battery percentage everywhere except in reading mode
   - "Always" - Always hide battery percentage
 
-- **Refresh Frequency**: Set how often the screen does a full refresh while reading to reduce ghosting; options are every 1, 5, 10, 15, or 30 pages.
+- **Refresh Frequency**: Set how often the screen does a full refresh while reading to reduce ghosting; options are every 1, 5, 10, 15, or 30 pages, or "Never". On Xteink X3 (UC8253 panel) with **Text Anti-Aliasing** enabled (and **Night Mode** off), two-pass 16-gray text refreshes run a cleanup refresh at least every 15 pages even when **Refresh Frequency** is set to 30 pages or **Never**.
 
 - **UI Theme**: Set which UI theme to use:
   

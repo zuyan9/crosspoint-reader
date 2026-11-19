@@ -240,9 +240,10 @@ class BaseTheme {
   // slot. Rescaling a dithered bitmap aliases badly, so overflow is cropped.
   static bool drawCoverThumbFill(const GfxRenderer& renderer, const Bitmap& bitmap, Rect slot, int xOffset = 0);
   static void drawProgressBar(const GfxRenderer& renderer, Rect rect, size_t current, size_t total);
-  void drawBatteryLeft(const GfxRenderer& renderer, Rect rect,
-                       bool showPercentage = true) const;  // Left aligned (reader mode)
-  virtual void fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage) const;
+  void drawBatteryLeft(const GfxRenderer& renderer, Rect rect, bool showPercentage = true, int pinnedPercentage = -1,
+                       int pinnedCharging = -1) const;  // Left aligned (reader mode)
+  virtual void fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage,
+                               int pinnedCharging = -1) const;
   virtual void drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
                                const char* btn4) const;
   // Shared by every theme's drawButtonHints(): centres a hint label in its box,
@@ -288,12 +289,24 @@ class BaseTheme {
                               const std::function<UIIcon(int index)>& rowIcon) const;
   static void drawSelectionHandle(const GfxRenderer& renderer, Rect rect, bool left);
   static void drawSelectionActions(const GfxRenderer& renderer, Rect rect, int count = 3, int firstAction = 0);
-  virtual Rect drawPopup(const GfxRenderer& renderer, const char* message) const;
+  struct StatusBarPinnedState {
+    uint16_t batteryPercentage = 0;
+    bool charging = false;
+    bool clockAvailable = false;
+    bool hasClock = false;
+    char clockText[16] = {};
+    bool titlePreTruncated = false;
+    bool titleUseRemainingSpace = false;
+  };
+  virtual Rect drawPopup(const GfxRenderer& renderer, const char* message, bool windowed = false) const;
   virtual void fillPopupProgress(const GfxRenderer& renderer, const Rect& layout, const int progress) const;
+  static void preparePinnedStatusBar(const GfxRenderer& renderer, float bookProgress, int currentPage, int pageCount,
+                                     std::string& title, bool isPageBookmarked, bool pageCountEstimated,
+                                     StatusBarPinnedState& pinned);
   static void drawStatusBar(GfxRenderer& renderer, const float bookProgress, const int currentPage, const int pageCount,
-                            std::string title, const int paddingBottom = 0, const int textYOffset = 0,
+                            const std::string& title, const int paddingBottom = 0, const int textYOffset = 0,
                             const bool fillMargin = true, const bool isPageBookmarked = false,
-                            const bool pageCountEstimated = false);
+                            const bool pageCountEstimated = false, const StatusBarPinnedState* pinned = nullptr);
   static void drawHelpText(const GfxRenderer& renderer, Rect rect, const char* label);
   virtual void drawTextField(const GfxRenderer& renderer, Rect rect, const int textWidth, bool cursorMode = false,
                              int contentStartX = 0, int contentWidth = 0) const;

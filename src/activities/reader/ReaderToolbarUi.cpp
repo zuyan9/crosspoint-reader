@@ -147,7 +147,9 @@ void ReaderToolbarUi::buildToolbar(UiScreen& screen) {
   sheetProps.grabberInset = static_cast<int16_t>(tokens.spaceLg + tokens.spaceMd);
   const int16_t grabberBand =
       static_cast<int16_t>(sheetProps.grabberMargin + sheetProps.grabberHeight + sheetProps.grabberInset);
-  screen.sheet(sheetProps, static_cast<int16_t>(contentH + grabberBand));
+  const int16_t sheetH = static_cast<int16_t>(contentH + grabberBand);
+  sheetTopY_ = std::max<int16_t>(0, static_cast<int16_t>(screen.frame().safeRect().bottom() - sheetH));
+  screen.sheet(sheetProps, sheetH);
   screen.insetContent(fui::Insets{0, tokens.spaceLg, 0, tokens.spaceLg});
   screen.spacer(tokens.spaceMd);
 
@@ -246,7 +248,9 @@ void ReaderToolbarUi::buildPanel(UiScreen& screen) {
   if (static_cast<int16_t>(chrome + (sheetRows + 1) * rowStride - rowGap) <= cap) ++sheetRows;
   if (model_.itemCount > 0 && sheetRows > model_.itemCount) sheetRows = model_.itemCount;
   if (sheetRows < 1) sheetRows = 1;
-  screen.sheet(sheetProps, static_cast<int16_t>(chrome + sheetRows * rowStride - rowGap));
+  const int16_t sheetH = static_cast<int16_t>(chrome + sheetRows * rowStride - rowGap);
+  sheetTopY_ = std::max<int16_t>(0, static_cast<int16_t>(safe.bottom() - sheetH));
+  screen.sheet(sheetProps, sheetH);
   // No blanket side inset: Screen::list() draws in the content band, and the
   // scroll track must reach the sheet's edge like a full-screen list's does.
   // The title insets itself; the rows inset via rowInset below.

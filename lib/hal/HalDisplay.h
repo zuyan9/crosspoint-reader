@@ -2,6 +2,15 @@
 #include <Arduino.h>
 #include <BoardConfig.h>
 #include <EInkDisplay.h>
+#include <GrayscaleCapabilities.h>
+
+#ifndef CROSSPOINT_SUPPORT_GRAY16
+#if !defined(FREEINK_DRIVER_UC8253_X3) || FREEINK_DRIVER_UC8253_X3 != 0
+#define CROSSPOINT_SUPPORT_GRAY16 1
+#else
+#define CROSSPOINT_SUPPORT_GRAY16 0
+#endif
+#endif
 
 class HalDisplay {
  public:
@@ -60,6 +69,7 @@ class HalDisplay {
                  bool fromProgmem = false) const;
 
   void displayBuffer(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false);
+  void displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool turnOffScreen = false);
   // Non-blocking refresh (shadow-free): starts the panel waveform and returns
   // while the panel refreshes on its own. The framebuffer must stay untouched
   // until waitRefreshComplete(), and the caller must rebuild the differential
@@ -78,6 +88,14 @@ class HalDisplay {
   bool isInverted() const;
 
   // Power management
+#if CROSSPOINT_SUPPORT_GRAY16
+  bool prewarmPowerOn();
+  bool serviceIdlePower();
+#else
+  bool prewarmPowerOn() { return false; }
+  bool serviceIdlePower() { return false; }
+#endif
+  void powerOffBetweenFrames();
   void deepSleep();
   // Power the panel down between frames, keeping its image; the next paint wakes it.
   void controllerIdle();
@@ -101,22 +119,51 @@ class HalDisplay {
   void preconditionGrayscale(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 
   // Display the framebuffer as the base frame for a grayscale overlay that
-  // follows. On X3, HALF fallback first requests a resync to match
-  // displayBuffer(HALF); FAST fallback keeps the OEM differential base waveform
-  // ("AA-pre-BW(mid)"). Other panels display normally with `fallback` mode.
+  // follows. On X3, 4-gray runs the OEM differential base waveform (with
+  // resync on HALF/FULL); 16-gray base uses displayGray16Base* below.
   void displayGrayscaleBase(RefreshMode fallback = HALF_REFRESH, bool turnOffScreen = false);
   bool displayGrayscaleBase(GrayscaleMode mode, RefreshMode fallback = HALF_REFRESH, bool turnOffScreen = false);
+  bool supportsDeferredGrayscaleBase() const;
+  bool displayGrayscaleBaseAsync(RefreshMode fallback = FAST_REFRESH);
 
   void copyGrayscaleLsbBuffers(const uint8_t* lsbBuffer);
   void copyGrayscaleMsbBuffers(const uint8_t* msbBuffer);
   void cleanupGrayscaleBuffers(const uint8_t* bwBuffer);
 
   void displayGrayBuffer(bool turnOffScreen = false);
+#if CROSSPOINT_SUPPORT_GRAY16
+  bool supportsGray16Planes() const;
+  bool supportsDeferredGray16Base() const;
+  void displayGray16Base(RefreshMode fallback = FAST_REFRESH, bool turnOffScreen = false);
+  bool displayGray16BaseAsync(RefreshMode fallback = FAST_REFRESH);
+  void displayGray16Pass1();
+  bool displayGray16Pass1Async();
+  void displayGray16Pass2(bool turnOffScreen = false);
+  bool displayGray16Pass2Async(bool turnOffScreen = false);
+  void beginGray16Cleanup(const uint8_t* bwBuffer);
+  void finishGray16Cleanup();
+#else
+  bool supportsGray16Planes() const { return false; }
+  bool supportsDeferredGray16Base() const { return false; }
+  void displayGray16Base(RefreshMode = FAST_REFRESH, bool = false) {}
+  bool displayGray16BaseAsync(RefreshMode = FAST_REFRESH) { return false; }
+  void displayGray16Pass1() {}
+  bool displayGray16Pass1Async() { return false; }
+  void displayGray16Pass2(bool = false) {}
+  bool displayGray16Pass2Async(bool = false) { return false; }
+  void beginGray16Cleanup(const uint8_t*) {}
+  void finishGray16Cleanup() {}
+#endif
+  // True when the latest display/refresh sequence committed on the panel;
+  // Gray16 callers check this after Base, Pass 1, and Pass 2 before continuing.
+  bool displayCommitted() const;
 
   // Tiled grayscale: stream one band of a plane (lsbPlane selects LSB/MSB RAM)
   // straight to the controller. Check grayscaleCapabilities(mode).stripUploads
   // with the same grayscale mode used for the planes.
   void writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* rows, uint16_t yStart, uint16_t numRows);
+  bool writeGrayscalePlaneGateStream(bool lsbPlane, void* ctx,
+                                     size_t (*nextChunk)(void* ctx, const uint8_t** outChunk));
 
   // Runtime geometry passthrough
   uint16_t getDisplayWidth() const;

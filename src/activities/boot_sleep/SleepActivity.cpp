@@ -9,7 +9,6 @@
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalDisplay.h>
-#include <HalGPIO.h>
 #include <HalStorage.h>
 #include <I18n.h>
 #include <Memory.h>
@@ -1124,11 +1123,7 @@ void SleepActivity::renderLastScreenSleepScreen() const {
   // Only the moon differs from the displayed frame, so a differential FAST
   // update adds it without the flashing clean pass (which sweeps the panel
   // through the inverse — a full white flash on a night-mode page).
-  if (gpio.deviceIsX3()) {
-    renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
-  } else {
-    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
-  }
+  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 }
 
 void SleepActivity::renderBlankSleepScreen() const {

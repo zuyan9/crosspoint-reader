@@ -34,6 +34,8 @@ class FontCacheManager {
   // Compacts unused SD font styles/variants, trailing 4bpp slabs, and (when
   // dropLayoutAdvanceCache is true) layout advance tables.
   void compactAfterPrewarm(bool dropLayoutAdvanceCache = true);
+  uint32_t prewarmGeneration() const { return prewarmGeneration_; }
+  bool canReuseLastPrewarmWithoutScope(uint32_t expectedGen) const;
   // Recommended lookahead depth for idle prewarming. TTF fonts on PSRAM
   // accumulate glyphs across multiple pages; single-page SD fonts use 1.
   int getIdleLookaheadPages(int fontId) const;
@@ -86,6 +88,9 @@ class FontCacheManager {
   static constexpr uint8_t SCAN_GROUP_COUNT = MAX_SCAN_FONTS * 4;
 
   uint8_t resolveScanStyle(int fontId, EpdFontFamily::Style style) const;
+  void bumpPrewarmGeneration() {
+    if (++prewarmGeneration_ == 0) prewarmGeneration_ = 1;
+  }
   int scanFontIds_[MAX_SCAN_FONTS] = {};
   uint32_t scanCodepoints_[MAX_SCAN_CODEPOINTS + 1] = {};
   uint16_t scanGroupCounts_[SCAN_GROUP_COUNT] = {};
@@ -93,8 +98,14 @@ class FontCacheManager {
   uint16_t scanCodepointCount_ = 0;
   uint8_t scanFontCount_ = 0;
   bool scanOverflowWarned_ = false;
+  bool scanOverflowed_ = false;
+  bool inScopePrewarm_ = false;
 
+  uint32_t prewarmGeneration_ = 1;
   int lastScanFontIds_[MAX_SCAN_FONTS] = {};
   uint8_t lastScanStyleMasks_[MAX_SCAN_FONTS] = {};
+  uint32_t lastScanSdGenerations_[MAX_SCAN_FONTS] = {};
   uint8_t lastScanFontCount_ = 0;
+  bool lastScanUsedNonSdCache_ = false;
+  bool lastScanOverflowed_ = false;
 };

@@ -125,6 +125,8 @@ class SdCardFont {
   // layout is idle) persistent advance tables on non-PSRAM boards right after
   // PrewarmScope::endScanAndPrewarm().
   void compactForRender(uint8_t activeStyleMask, bool dropLayoutAdvanceCache);
+  bool areStylesRenderResident(uint8_t styleMask) const;
+  uint32_t residentGeneration() const { return residentGeneration_; }
 
   // Drop the persistent advance cache. Call when unloading the SD font or
   // when font/size/family/glyph-table state changes, or to recover a failed bitmap allocation.
@@ -320,6 +322,7 @@ class SdCardFont {
   // Zero means absent; present styles store their array slot plus one.
   uint8_t styleSlots_[MAX_STYLES] = {};
   PerStyle& styleData(uint8_t style) { return styles_[styleSlots_[style] - 1]; }
+  const PerStyle& styleData(uint8_t style) const { return styles_[styleSlots_[style] - 1]; }
   uint8_t styleCount_ = 0;
 
   char filePath_[128] = {};
@@ -376,6 +379,7 @@ class SdCardFont {
   Stats stats_;
   uint32_t contentHash_ = 0;
   uint32_t fileSize_ = 0;  // bounds glyph bitmap offsets (glyphEntryValid)
+  uint32_t residentGeneration_ = 1;
   uint8_t corruptGlyphsLogged_ = 0;
   static inline std::atomic<bool> corruptGlyphNotice_{false};
   bool loaded_ = false;

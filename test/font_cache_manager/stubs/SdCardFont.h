@@ -21,23 +21,28 @@ class SdCardFont {
     lastCompactDropAdvance = dropLayoutAdvanceCache;
     compactCallCount++;
   }
+  bool areStylesRenderResident(uint8_t styleMask) const { return (residentStyleMask & styleMask) == styleMask; }
+  uint32_t residentGeneration() const { return residentGen; }
   int prewarm(const char* text, uint8_t styleMask, bool, bool, bool accumulate) {
-    if (prewarmCallCount < 8) {
+    if (prewarmCallCount < 16) {
       auto& call = prewarmCalls[prewarmCallCount];
       std::snprintf(call.text, sizeof(call.text), "%s", text);
       call.styleMask = styleMask;
       call.accumulate = accumulate;
     }
     prewarmCallCount++;
+    residentStyleMask |= styleMask;
     return 0;
   }
   uint8_t resolveStyle(uint8_t style) const { return resolvedStyles[style & 0x03]; }
   void logStats(const char*) {}
   void resetStats() {}
 
-  PrewarmCall prewarmCalls[8] = {};
+  PrewarmCall prewarmCalls[16] = {};
   int prewarmCallCount = 0;
   uint8_t resolvedStyles[4] = {0, 1, 2, 3};
+  uint8_t residentStyleMask = 0;
+  uint32_t residentGen = 1;
   uint8_t lastCompactStyleMask = 0xFF;
   bool lastCompactDropAdvance = false;
   int compactCallCount = 0;

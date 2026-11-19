@@ -15,6 +15,7 @@
 #include <string>
 
 #include "lib/GfxRenderer/GlyphBitmap.h"
+#include "lib/GfxRenderer/Gray16ZeroRle.h"
 
 namespace {
 size_t failNextArraySize = 0;
@@ -1962,5 +1963,220 @@ TEST(SdCardFontTest, MultiStringFourBitPrewarmUnderTightHeapUsesZeroSlabSpillAnd
     std::vector<std::string> rows = {page(FIRST, 2), page(FIRST + 2, 2)};
     EXPECT_EQ(-1, font.prewarm(rowGetter, &rows, static_cast<uint32_t>(rows.size()), 0x01,
                                /*metadataOnly=*/false, /*loadKernLig=*/false, /*accumulate=*/true));
+  }
+}
+
+TEST(SdCardFontTest, AreStylesRenderResidentTracksGenerationMetadataOnlyAndSpilledGlyphs) {
+  make4BitFont(200, 29, 29);
+  SdCardFont font;
+  ASSERT_TRUE(font.load("fixture"));
+  EXPECT_FALSE(font.areStylesRenderResident(0x01));
+
+  // Metadata-only prewarm is not render-resident.
+  EXPECT_EQ(0, font.prewarm(page(FIRST, 6).c_str(), 0x01, /*metadataOnly=*/true, /*loadKernLig=*/false));
+  EXPECT_FALSE(font.areStylesRenderResident(0x01));
+
+  // Full render prewarm fitting in slabs is render-resident; compactForRender(0x01) preserves generation.
+  EXPECT_EQ(0, font.prewarm(page(FIRST, 6).c_str(), 0x01, /*metadataOnly=*/false, /*loadKernLig=*/false,
+                            /*accumulate=*/false));
+  EXPECT_TRUE(font.areStylesRenderResident(0x01));
+  const uint32_t genResident = font.residentGeneration();
+  font.compactForRender(0x01, /*dropLayoutAdvanceCache=*/true);
+  EXPECT_TRUE(font.areStylesRenderResident(0x01));
+  EXPECT_EQ(genResident, font.residentGeneration());
+
+  // Dense page with spilled 4bpp glyphs (miniSpilledCount > 0) reports non-resident so multi-strip
+  // Gray16 passes keep PrewarmScope's cachedReadFile_ open and clear overflow_ on exit.
+  EXPECT_GT(font.prewarm(page(FIRST, 150).c_str(), 0x01, /*metadataOnly=*/false, /*loadKernLig=*/false,
+                         /*accumulate=*/false),
+            0);
+  EXPECT_FALSE(font.areStylesRenderResident(0x01));
+  EXPECT_NE(genResident, font.residentGeneration());
+
+  // Re-prewarming a resident subset restores render residency; evicting inactive styles bumps generation.
+  EXPECT_EQ(0, font.prewarm(page(FIRST, 6).c_str(), 0x01, /*metadataOnly=*/false, /*loadKernLig=*/false,
+                            /*accumulate=*/false));
+  EXPECT_TRUE(font.areStylesRenderResident(0x01));
+  const uint32_t genBeforeEvict = font.residentGeneration();
+  font.compactForRender(0x00, /*dropLayoutAdvanceCache=*/true);
+  EXPECT_FALSE(font.areStylesRenderResident(0x01));
+  EXPECT_NE(genBeforeEvict, font.residentGeneration());
+}
+
+TEST(SdCardFontTest, FourBitAndTwoBitCpfontsRenderSplitRailGray16StripsAndCleanup) {
+  constexpr int kWidth = 792;
+  constexpr int kWidthBytes = kWidth / 8;
+  constexpr int kHeight = 528;
+  constexpr int kStripY0 = 480;
+  constexpr int kStripRows = 48;
+
+  // 1. Build a v4 4-bit .cpfont (flags = CPFONT_FLAG_4BIT) with a 16x4 ramp glyph 'R' (column x has ink = x).
+  constexpr size_t hdrSize = 32;
+  constexpr size_t tocSize = 32;
+  constexpr size_t ivSize = 2 * sizeof(EpdUnicodeInterval);
+  constexpr size_t glSize = 2 * sizeof(EpdGlyph);
+  constexpr uint16_t rampBytes4 = (16 * 4 + 1) / 2;
+  sdFontTestFile.assign(hdrSize + tocSize + ivSize + glSize + rampBytes4 * 2, 0);
+  std::memcpy(sdFontTestFile.data(), "CPFONT\0\0", 8);
+  put16(8, 4);
+  put16(10, SdCardFont::CPFONT_FLAG_4BIT);
+  sdFontTestFile[12] = 1;
+  const size_t dataOff = hdrSize + tocSize;
+  put32(hdrSize + 4, 2);
+  put32(hdrSize + 8, 2);
+  sdFontTestFile[hdrSize + 12] = 24;
+  put16(hdrSize + 13, 18);
+  put16(hdrSize + 15, static_cast<uint16_t>(-6));
+  put32(hdrSize + 24, static_cast<uint32_t>(dataOff));
+
+  const EpdUnicodeInterval ivs[2] = {{'R', 'R', 0}, {0xFFFD, 0xFFFD, 1}};
+  std::memcpy(sdFontTestFile.data() + dataOff, ivs, ivSize);
+  EpdGlyph gls4[2] = {};
+  for (int i = 0; i < 2; ++i) {
+    gls4[i] = {16, 4, 16 << 4, 0, 4, rampBytes4, static_cast<uint32_t>(i * rampBytes4)};
+  }
+  std::memcpy(sdFontTestFile.data() + dataOff + ivSize, gls4, glSize);
+  uint8_t rowBytes4[8];
+  for (int b = 0; b < 8; ++b) {
+    rowBytes4[b] = static_cast<uint8_t>(((b * 2) << 4) | (b * 2 + 1));
+  }
+  uint8_t* bmpDst4 = sdFontTestFile.data() + dataOff + ivSize + glSize;
+  for (int g = 0; g < 2; ++g) {
+    for (int r = 0; r < 4; ++r) {
+      std::memcpy(bmpDst4 + g * rampBytes4 + r * 8, rowBytes4, 8);
+    }
+  }
+
+  SdCardFont font4;
+  ASSERT_TRUE(font4.load("Ramp4b_16.cpfont"));
+  ASSERT_EQ(0, font4.prewarm("R", 0x01));
+  const EpdFont* epd4 = font4.getEpdFont(0);
+  ASSERT_NE(nullptr, epd4);
+  ASSERT_TRUE(epd4->data->is4Bit);
+  ASSERT_EQ(4u, epdBitsPerPixel(*epd4->data));
+  const EpdGlyph* g4 = epd4->getGlyph('R');
+  ASSERT_NE(nullptr, g4);
+  const uint8_t* bmp4 = epd4->data->bitmapHandler(epd4->data->glyphMissCtx, g4);
+  ASSERT_NE(nullptr, bmp4);
+
+  // Portrait X3 physical placement for logical (lx = 16, ly = 24): phyX = ly, phyY = 527 - lx, dxX=0, dxY=-1, dyX=1,
+  // dyY=0.
+  const glyphBitmap::Frame physFrame{24, kHeight - 1 - 16, 0, -1, 1, 0};
+  const glyphBitmap::Clip fullClip{0, 0, g4->width, g4->height};
+
+  std::vector<uint8_t> bwPlane(static_cast<size_t>(kWidthBytes) * kHeight, 0xFFu);
+  glyphBitmap::draw(bmp4, g4->width, g4->height, epdBitsPerPixel(*epd4->data), glyphBitmap::Plane::Gray16BW, true,
+                    {bwPlane.data(), kWidth, kWidthBytes, 0, kHeight, physFrame}, fullClip);
+
+  auto renderStrip = [&](glyphBitmap::Plane plane, uint8_t initVal) {
+    std::vector<uint8_t> strip(static_cast<size_t>(kWidthBytes) * kStripRows, initVal);
+    glyphBitmap::draw(bmp4, g4->width, g4->height, epdBitsPerPixel(*epd4->data), plane, true,
+                      {strip.data(), kWidth, kWidthBytes, kStripY0, kStripRows, physFrame}, fullClip);
+    return strip;
+  };
+  const auto cLsb = renderStrip(glyphBitmap::Plane::Gray16CoarseLSB, 0x00u);
+  const auto cMsb = renderStrip(glyphBitmap::Plane::Gray16CoarseMSB, 0x00u);
+  const auto fLsb = renderStrip(glyphBitmap::Plane::Gray16FineLSB, 0x00u);
+  const auto fMsb = renderStrip(glyphBitmap::Plane::Gray16FineMSB, 0x00u);
+  auto cleanDtm1 = renderStrip(glyphBitmap::Plane::Gray16CleanupDTM1, 0xFFu);
+
+  auto readBit = [&](const uint8_t* plane, int lx, int ly, int yOrigin) -> uint8_t {
+    const int phyX = ly;
+    const int phyY = kHeight - 1 - lx;
+    const size_t idx = static_cast<size_t>(phyY - yOrigin) * kWidthBytes + static_cast<size_t>(phyX / 8);
+    return (plane[idx] >> (7 - (phyX % 8))) & 1u;
+  };
+
+  for (int ink = 0; ink < 16; ++ink) {
+    const int lx = 16 + ink;
+    const int ly = 25;
+    const uint8_t bw = readBit(bwPlane.data(), lx, ly, 0);
+    const uint8_t cl = readBit(cLsb.data(), lx, ly, kStripY0);
+    const uint8_t cm = readBit(cMsb.data(), lx, ly, kStripY0);
+    const uint8_t fl = readBit(fLsb.data(), lx, ly, kStripY0);
+    const uint8_t fm = readBit(fMsb.data(), lx, ly, kStripY0);
+    const uint8_t cln = readBit(cleanDtm1.data(), lx, ly, kStripY0);
+    const uint8_t code5 = static_cast<uint8_t>((bw << 4) | (cl << 3) | (cm << 2) | (fl << 1) | fm);
+    EXPECT_EQ(static_cast<uint8_t>(15 - ink), freeink::gray16::kDecodeGray16[code5]) << "ink=" << ink;
+    EXPECT_EQ(ink >= 1 ? 0u : 1u, cln) << "cleanup ink=" << ink;
+  }
+
+  // Round-trip CleanupDTM1 through inverted Gray16ZeroRle + GateStreamReader:
+  std::vector<uint8_t> rleBuf(Gray16ZeroRle::BUFFER_BYTES, 0u);
+  Gray16ZeroRle::PlaneStripIndex cleanIdx{};
+  size_t cleanCursor = 0;
+  std::vector<uint8_t> expectedCleanCopy = cleanDtm1;
+  {
+    Gray16ZeroRleEncoder enc(rleBuf.data(), rleBuf.size(), cleanCursor, cleanIdx);
+    ASSERT_TRUE(enc.appendStripInverted(cleanDtm1.data(), kStripRows, kWidthBytes));
+    ASSERT_TRUE(enc.finish());
+  }
+  std::vector<uint8_t> gateScratch(static_cast<size_t>(kWidthBytes) * kStripRows, 0u);
+  Gray16ZeroRle::GateStreamReader cleanReader(rleBuf.data(), cleanCursor, cleanIdx, gateScratch.data(),
+                                              gateScratch.size(), kStripRows, kStripRows, kWidthBytes,
+                                              /*invertOutput=*/true);
+  const uint8_t* gateChunk = nullptr;
+  ASSERT_EQ(gateScratch.size(), cleanReader.next(&gateChunk));
+  EXPECT_EQ(0u, cleanReader.next(&gateChunk));
+  EXPECT_TRUE(cleanReader.ok());
+  for (int r = 0; r < kStripRows; ++r) {
+    EXPECT_EQ(0, std::memcmp(gateScratch.data() + static_cast<size_t>(kStripRows - 1 - r) * kWidthBytes,
+                             expectedCleanCopy.data() + static_cast<size_t>(r) * kWidthBytes, kWidthBytes));
+  }
+
+  // 2. Also verify a standard 2-bit .cpfont (CPFONT_FLAG_2BIT) maps 2bpp inks [0, 1, 2, 3] -> Gray16 [15, 9, 6, 0].
+  constexpr uint16_t bmpBytes2 = 2;
+  sdFontTestFile.assign(hdrSize + tocSize + ivSize + glSize + bmpBytes2 * 2, 0);
+  std::memcpy(sdFontTestFile.data(), "CPFONT\0\0", 8);
+  put16(8, 4);
+  put16(10, SdCardFont::CPFONT_FLAG_2BIT);
+  sdFontTestFile[12] = 1;
+  put32(hdrSize + 4, 2);
+  put32(hdrSize + 8, 2);
+  sdFontTestFile[hdrSize + 12] = 20;
+  put16(hdrSize + 13, 16);
+  put16(hdrSize + 15, static_cast<uint16_t>(-4));
+  put32(hdrSize + 24, static_cast<uint32_t>(dataOff));
+  const EpdUnicodeInterval ivs2[2] = {{'N', 'N', 0}, {0xFFFD, 0xFFFD, 1}};
+  std::memcpy(sdFontTestFile.data() + dataOff, ivs2, ivSize);
+  const EpdGlyph gls2[2] = {{4, 2, 4 << 4, 0, 2, bmpBytes2, 0}, {4, 2, 4 << 4, 0, 2, bmpBytes2, bmpBytes2}};
+  std::memcpy(sdFontTestFile.data() + dataOff + ivSize, gls2, glSize);
+  std::fill_n(sdFontTestFile.data() + dataOff + ivSize + glSize, bmpBytes2 * 2, 0x1Bu);  // [0, 1, 2, 3]
+
+  SdCardFont font2;
+  ASSERT_TRUE(font2.load("Serif2b_14.cpfont"));
+  ASSERT_EQ(0, font2.prewarm("N", 0x01));
+  const EpdFont* epd2 = font2.getEpdFont(0);
+  EXPECT_FALSE(epd2->data->is4Bit);
+  ASSERT_EQ(2u, epdBitsPerPixel(*epd2->data));
+  const EpdGlyph* g2 = epd2->getGlyph('N');
+  const uint8_t* bmp2 = epd2->data->bitmapHandler(epd2->data->glyphMissCtx, g2);
+  ASSERT_NE(nullptr, bmp2);
+
+  const glyphBitmap::Frame frame2{24, kHeight - 1 - 20, 0, -1, 1, 0};
+  const glyphBitmap::Clip clip2{0, 0, 4, 2};
+  std::fill(bwPlane.begin(), bwPlane.end(), 0xFFu);
+  glyphBitmap::draw(bmp2, 4, 2, epdBitsPerPixel(*epd2->data), glyphBitmap::Plane::Gray16BW, true,
+                    {bwPlane.data(), kWidth, kWidthBytes, 0, kHeight, frame2}, clip2);
+  auto renderStrip2 = [&](glyphBitmap::Plane plane, uint8_t initVal) {
+    std::vector<uint8_t> strip(static_cast<size_t>(kWidthBytes) * kStripRows, initVal);
+    glyphBitmap::draw(bmp2, 4, 2, epdBitsPerPixel(*epd2->data), plane, true,
+                      {strip.data(), kWidth, kWidthBytes, kStripY0, kStripRows, frame2}, clip2);
+    return strip;
+  };
+  const auto c2Lsb = renderStrip2(glyphBitmap::Plane::Gray16CoarseLSB, 0x00u);
+  const auto c2Msb = renderStrip2(glyphBitmap::Plane::Gray16CoarseMSB, 0x00u);
+  const auto f2Lsb = renderStrip2(glyphBitmap::Plane::Gray16FineLSB, 0x00u);
+  const auto f2Msb = renderStrip2(glyphBitmap::Plane::Gray16FineMSB, 0x00u);
+  const auto clean2 = renderStrip2(glyphBitmap::Plane::Gray16CleanupDTM1, 0xFFu);
+  constexpr std::array<uint8_t, 4> kExpected2BitGray = {15, 9, 6, 0};
+  for (int v = 0; v < 4; ++v) {
+    const int lx = 20 + v;
+    const uint8_t code5 = static_cast<uint8_t>(
+        (readBit(bwPlane.data(), lx, 24, 0) << 4) | (readBit(c2Lsb.data(), lx, 24, kStripY0) << 3) |
+        (readBit(c2Msb.data(), lx, 24, kStripY0) << 2) | (readBit(f2Lsb.data(), lx, 24, kStripY0) << 1) |
+        readBit(f2Msb.data(), lx, 24, kStripY0));
+    EXPECT_EQ(kExpected2BitGray[v], freeink::gray16::kDecodeGray16[code5]) << "v=" << v;
+    EXPECT_EQ(v >= 1 ? 0u : 1u, readBit(clean2.data(), lx, 24, kStripY0)) << "cleanup v=" << v;
   }
 }

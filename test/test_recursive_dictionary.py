@@ -661,4 +661,14 @@ with tempfile.TemporaryDirectory() as directory:
                     str(ROOT / "lib/Epub/Epub/hyphenation/HyphenationCommon.cpp"),
                     "-o", str(path / "lookup")], check=True)
     subprocess.run([str(path / "lookup")], check=True)
+
+apply_orient = block(reader_source, "void EpubReaderActivity::applyOrientation")
+assert "if (renderer.supportsGray16Planes())" in apply_orient and "pagesUntilFullRefresh = 1;" in apply_orient
+close_overlay = block(reader_source, "void EpubReaderActivity::closeOverlayToPage")
+assert "if (BoardConfig::isEegoA4())" in close_overlay and "pagesUntilFullRefresh = 1;" in close_overlay
+assert "if (useGray16 && renderer.consumeDirtyGray16Baseline())" in reader_source
+assert "const bool cleanImageBasePending = manualRefreshPending || pagesUntilFullRefresh <= 1 || pageHasImagesNeedingDecode;" in reader_source
+assert "bool runGrayscalePass = needsAnyGrayscale && grayscale.supported();" in reader_source
+assert "renderer.beginGray16Cleanup(/*uploadFrameBuffer=*/false);" in reader_source
+assert "renderCleanupToFrameBuffer" not in reader_source
 print("Recursive dictionary navigation checks passed")

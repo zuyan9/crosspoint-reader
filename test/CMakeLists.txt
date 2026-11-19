@@ -32,6 +32,7 @@ add_library(crosspoint_test_common INTERFACE)
 target_include_directories(crosspoint_test_common INTERFACE
   ${REPO_ROOT}
   ${REPO_ROOT}/lib
+  ${REPO_ROOT}/freeink-sdk/libs/display/FreeInkDisplay/include
 )
 target_compile_options(crosspoint_test_common INTERFACE
   -Wall
@@ -89,6 +90,7 @@ add_subdirectory(http_header)
 add_subdirectory(txt_to_html)
 
 add_subdirectory(absolute_grayscale)
+add_subdirectory(gray16_zero_rle)
 
 add_subdirectory(gif_support)
 
@@ -128,3 +130,4 @@ add_test(NAME clipping_selection_text COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURR
 
 add_test(NAME recursive_dictionary COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_recursive_dictionary.py)
 add_test(NAME fontconvert_4bit COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/sd_card_font/test_fontconvert_4bit.py)
+add_test(NAME uc8253_x3_driver COMMAND ${Python3_EXECUTABLE} ${REPO_ROOT}/freeink-sdk/libs/display/FreeInkDisplay/test/host/run_uc8253_power.py)

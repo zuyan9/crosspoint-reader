@@ -75,6 +75,8 @@ class ReaderToolbarUi : public UiAppHost {
   freeink::ui::ListNav& nav() { return nav_; }
   // Rows one page holds, measured after the first render.
   int visibleRows() const { return nav_.pageRows(); }
+  // Top logical Y of the most recently built bottom sheet.
+  int16_t sheetTopY() const { return sheetTopY_; }
 
  private:
   static void screenFn(UiScreen& screen, void* user);
@@ -98,4 +100,5 @@ class ReaderToolbarUi : public UiAppHost {
   freeink::ui::ButtonProps stepProps_;
   freeink::ui::ListProps listProps_;
   freeink::ui::Rect pageIndicatorRect_{};
+  int16_t sheetTopY_ = 0;
 };

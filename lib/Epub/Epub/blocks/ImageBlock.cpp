@@ -305,7 +305,9 @@ void ImageBlock::releaseRenderCache() { releasePxcSlot(); }
 void ImageBlock::renderPlaceholder(GfxRenderer& renderer, const int x, const int y) const {
   renderer.fillRect(x, y, width, height, true);
   if (width > 2 && height > 2) {
-    renderer.fillRect(x + 1, y + 1, width - 2, height - 2, false);
+    if (!renderer.isOverlayGrayPlane()) {
+      renderer.fillRect(x + 1, y + 1, width - 2, height - 2, false);
+    }
   }
 }
 

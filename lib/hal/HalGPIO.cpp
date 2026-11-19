@@ -151,17 +151,29 @@ bool HalGPIO::rawInputActive() {
 #if FREEINK_DEVICE_LILYGO
   if (BoardConfig::ACTIVE.board == BoardConfig::Board::LilyGoT5S3 && BoardT5S3::readButton()) return true;
 #endif
+  if (BoardConfig::ACTIVE.inputStyle == BoardConfig::InputStyle::XteinkAdcLadder) {
+    InputManager::ButtonAdcSample g1{}, g2{};
+    inputMgr.readButtonAdc(g1, g2);
+    return g1.button >= 0 || g2.button >= 0;
+  }
+  if (BoardConfig::ACTIVE.inputStyle == BoardConfig::InputStyle::OnePageAdcLadder) {
+    if (BoardConfig::ACTIVE.input.adcLadderPin >= 0 &&
+        analogReadMilliVolts(BoardConfig::ACTIVE.input.adcLadderPin) <= 2800) {
+      return true;
+    }
+    const int8_t upDownPins[] = {BoardConfig::ACTIVE.input.up, BoardConfig::ACTIVE.input.down};
+    for (const int8_t pin : upDownPins) {
+      if (pin >= 0 && digitalRead(pin) == LOW) return true;
+    }
+    return false;
+  }
   const int8_t pins[] = {BoardConfig::ACTIVE.input.back, BoardConfig::ACTIVE.input.confirm,
                          BoardConfig::ACTIVE.input.left, BoardConfig::ACTIVE.input.right,
                          BoardConfig::ACTIVE.input.up,   BoardConfig::ACTIVE.input.down};
   for (const int8_t pin : pins) {
     if (pin >= 0 && digitalRead(pin) == LOW) return true;
   }
-  InputManager::ButtonAdcSample g1{}, g2{};
-  inputMgr.readButtonAdc(g1, g2);
-  // The Xteink ladder idles at the ADC full-scale rail (~4095); every button band sits below 3900.
-  constexpr int kIdleRailMin = 4000;
-  return (g1.raw >= 0 && g1.raw < kIdleRailMin) || (g2.raw >= 0 && g2.raw < kIdleRailMin);
+  return false;
 }
 
 unsigned long HalGPIO::getHeldTime() const { return inputMgr.getHeldTime(); }

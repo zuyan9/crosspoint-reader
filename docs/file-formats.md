@@ -800,10 +800,13 @@ Header `flags` (`uint16_t` at byte offset `10`) selects the glyph bitmap bit dep
 
 Unknown flag bits or setting both `0x0001` and `0x0002` is invalid and rejected on
 load. Older firmware versions without 4-bit `.cpfont` support treat `flags = 0x0002`
-glyphs as corrupt, drawing blank text and reporting `"Damaged font file"`. 4-bit
-`.cpfont` files and direct `.ttf`/`.otf`/`.ttc` reader faces render in 4-level
-grayscale when **Text Anti-Aliasing** is enabled and supported in the active display
-mode (most panels disable grayscale in **Night Mode**), or in monochrome otherwise.
+glyphs as corrupt, drawing blank text and reporting `"Damaged font file"`. **Xteink X3
+(UC8253 panel)** runs the two-pass 16-gray refresh for 4-bit `.cpfont` files when
+**Text Anti-Aliasing** is enabled and **Night Mode** is off, while other panels
+(including UC8279 X3, X4, and external-RAM boards) render 4-bit `.cpfont` files and
+direct `.ttf`/`.otf`/`.ttc` reader faces in 4-level grayscale when **Text
+Anti-Aliasing** is enabled and supported in the active display mode (most panels
+disable grayscale in **Night Mode**), or in monochrome otherwise.
 
 ## `.cpfont` shaping section
 
